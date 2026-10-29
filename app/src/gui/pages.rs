@@ -13,6 +13,9 @@ pub fn nav(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("Connect").size(22.0).strong().color(theme::ACCENT));
     ui.add_space(18.0);
     for (page, label) in [(Page::Share, "Share this PC"), (Page::Connect, "Connect"), (Page::Settings, "Settings")] {
+        if page == Page::Share && !VideoSource::SCREEN_SUPPORTED {
+            continue;
+        }
         let button = egui::Button::selectable(app.page == page, RichText::new(label).size(15.0))
             .min_size(egui::vec2(ui.available_width(), 36.0));
         if ui.add(button).clicked() {
@@ -82,9 +85,6 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
         if ui.checkbox(&mut accepting, "Allow incoming connections").changed() {
             app.settings.accepting = accepting;
             app.host.set_accepting(accepting);
-        }
-        if !VideoSource::SCREEN_SUPPORTED {
-            ui.label(RichText::new("Screen capture needs Windows; this PC shares a test pattern.").weak());
         }
     });
     ui.add_space(6.0);

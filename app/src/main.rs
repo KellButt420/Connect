@@ -3,10 +3,13 @@
 //! With no arguments this opens the app. The headless commands exist for testing without a display:
 //!
 //! ```text
-//! connect host [--test-pattern]      share this PC; Allow/Deny is asked on the terminal
+//! connect host [--test-pattern]      share this PC (Windows); Allow/Deny is asked on the terminal
 //! connect join <USER-ID> [--seconds N]
 //! connect id                          print this PC's User-ID
 //! ```
+//!
+//! Only Windows can host; other platforms can only connect. `--test-pattern` hosts a generated
+//! image anywhere, for development.
 //!
 //! Set `CONNECT_CONFIG_DIR` to use a separate identity, e.g. to run two copies on one PC, and
 //! `CONNECT_RENDERER=glow` if the window stays blank (falls back from wgpu to plain OpenGL).
@@ -23,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
 usage: connect                        open the app
-       connect host [--test-pattern]  share this PC from the terminal
+       connect host [--test-pattern]  share this PC from the terminal (Windows)
        connect join <USER-ID> [--seconds N]
        connect id                     print this PC's User-ID";
 

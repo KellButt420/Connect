@@ -1,0 +1,25 @@
+# Windows builds are cross-compiled from Linux with mingw-w64:
+#   cargo build --release --target x86_64-pc-windows-gnu -p connect
+# The C/C++ runtimes (openh264 is C++) are linked statically so connect.exe runs without extra DLLs.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    # Appended after every library, so this static libstdc++ is what openh264 resolves against.
+    # It needs libgcc and the C runtime too, which rustc has already listed earlier, hence the group.
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-Wl,--start-group",
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-lgcc",
+    "-C", "link-arg=-lgcc_eh",
+    "-C", "link-arg=-lmingw32",
+    "-C", "link-arg=-lmingwex",
+    "-C", "link-arg=-lmsvcrt",
+    "-C", "link-arg=-lkernel32",
+    "-C", "link-arg=-Wl,--end-group",
+]
+
+[env]
+# Stops the cc crate asking for a dynamic libstdc++ (libstdc++-6.dll); linked statically above.
+CXXSTDLIB_x86_64_pc_windows_gnu = ""

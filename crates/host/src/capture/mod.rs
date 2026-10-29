@@ -9,9 +9,10 @@ use std::time::Duration;
 use anyhow::Result;
 
 /// Where the host's video comes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VideoSource {
-    /// The primary monitor. Windows only.
+    /// The primary monitor. Windows only: elsewhere every connection is turned away.
+    #[default]
     Screen,
     /// A generated moving pattern, for testing without a display.
     TestPattern { width: u32, height: u32, fps: u32 },
@@ -20,7 +21,8 @@ pub enum VideoSource {
 impl VideoSource {
     pub const TEST_PATTERN: VideoSource = VideoSource::TestPattern { width: 1280, height: 720, fps: 60 };
 
-    /// Whether this build can capture the real screen.
+    /// Whether this build can capture the real screen, and so can host. Other platforms can
+    /// only connect to a host.
     pub const SCREEN_SUPPORTED: bool = cfg!(windows);
 
     pub(crate) fn open(&self) -> Result<Box<dyn Capturer>> {
@@ -33,12 +35,6 @@ impl VideoSource {
                 Ok(Box::new(test_pattern::TestPattern::new(width, height, fps)))
             }
         }
-    }
-}
-
-impl Default for VideoSource {
-    fn default() -> Self {
-        if Self::SCREEN_SUPPORTED { VideoSource::Screen } else { VideoSource::TEST_PATTERN }
     }
 }
 

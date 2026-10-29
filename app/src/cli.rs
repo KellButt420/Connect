@@ -21,8 +21,8 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
             other => bail!("unknown option {other:?} for `connect host`"),
         }
     }
-    if !VideoSource::SCREEN_SUPPORTED {
-        println!("(Screen capture is Windows-only; sharing a test pattern.)");
+    if video == VideoSource::Screen && !VideoSource::SCREEN_SUPPORTED {
+        bail!("hosting needs Windows; this PC can only connect to others (`--test-pattern` serves a test image, for development)");
     }
 
     let endpoint = net::bind_endpoint(key).await?;

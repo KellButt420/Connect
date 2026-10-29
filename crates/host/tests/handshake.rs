@@ -167,6 +167,17 @@ async fn not_accepting_turns_everyone_away() {
     );
 }
 
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn only_windows_can_host() {
+    let (host_ep, _host, _host_events) = start_host(HostConfig::new("Linux box")).await;
+    let (_client_ep, _client, mut client_events) = start_client(&host_ep).await;
+    match ended(&mut client_events).await {
+        EndReason::Rejected(reason) => assert!(reason.contains("hosting needs Windows"), "{reason}"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_giving_up_withdraws_the_prompt() {
     let (host_ep, _host, mut host_events) = start_host(config()).await;

@@ -17,7 +17,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    ConnectionRequest, Decision, HostEvent, Shared,
+    ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
     encode::{VideoEvent, VideoStream},
 };
 
@@ -31,6 +31,7 @@ const NO_ANSWER: &str = "The host didn't answer in time.";
 const BUSY: &str = "The host is in another session right now.";
 const NOT_ACCEPTING: &str = "The host isn't accepting connections right now.";
 const NO_CAPTURE: &str = "The host couldn't capture its screen.";
+const CANNOT_HOST: &str = "That PC can't be shared: hosting needs Windows. It can still connect to others.";
 
 pub(crate) async fn run(incoming: Incoming, shared: Arc<Shared>, events: mpsc::Sender<HostEvent>) {
     let conn = match incoming.accept() {
@@ -60,6 +61,9 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
              Update both PCs to the same version."
         );
         return reject(conn, &mut send, &reason).await;
+    }
+    if shared.video == VideoSource::Screen && !VideoSource::SCREEN_SUPPORTED {
+        return reject(conn, &mut send, CANNOT_HOST).await;
     }
     if !shared.accepting.load(std::sync::atomic::Ordering::Relaxed) {
         return reject(conn, &mut send, NOT_ACCEPTING).await;

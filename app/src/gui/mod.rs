@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::Result;
 use connect_client::{ClientEvent, ClientHandle, Stage};
-use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle};
+use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle, VideoSource};
 use connect_net::{
     self as net,
     iroh::{Endpoint, EndpointId, SecretKey},
@@ -141,7 +141,8 @@ impl App {
             host_events: forward_host_events(events, cc.egui_ctx.clone()),
             requests: VecDeque::new(),
             hosting: None,
-            page: Page::Share,
+            // Only Windows can host; elsewhere the host just turns callers away with the reason.
+            page: if VideoSource::SCREEN_SUPPORTED { Page::Share } else { Page::Connect },
             connect_input: String::new(),
             client: None,
             notice: None,
