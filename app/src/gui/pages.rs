@@ -4,10 +4,15 @@ use std::sync::atomic::Ordering;
 
 use connect_host::VideoSource;
 use connect_net as net;
-use connect_proto::{DeviceClass, Permissions};
+use connect_proto::DeviceClass;
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit};
 
-use super::{App, ClientState, Page, theme};
+use super::{
+    App, ClientState, Page,
+    prompt::{gamepad_warning, permission_toggles},
+    settings::BITRATE_CHOICES_MBPS,
+    theme,
+};
 
 pub fn nav(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("Connect").size(22.0).strong().color(theme::ACCENT));
@@ -65,9 +70,10 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
 
+    let gamepad_problem = app.gamepad_support.as_ref().err().cloned();
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        if let Some(hosting) = &app.hosting {
+        if let Some(hosting) = &mut app.hosting {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} is connected", hosting.client_name)).strong().color(theme::GOOD));
                 ui.label(RichText::new(format!("for {}", elapsed(hosting.since))).weak());
@@ -78,6 +84,15 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             });
+            ui.label("They can use:");
+            if permission_toggles(ui, &mut hosting.permissions) {
+                app.host.set_permissions(hosting.permissions);
+            }
+            if hosting.permissions.allows(DeviceClass::Gamepad)
+                && let Some(problem) = &gamepad_problem
+            {
+                gamepad_warning(ui, problem);
+            }
             ui.separator();
         }
 
@@ -91,25 +106,26 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
 
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::section_title(ui, "What the other person can use");
-        let mut permissions = app.settings.permissions;
-        ui.horizontal(|ui| {
-            for device in DeviceClass::ALL {
-                let mut allowed = permissions.allows(device);
-                if ui.checkbox(&mut allowed, device.label()).changed() {
-                    permissions = permissions.with(device, allowed);
-                }
-            }
-            ui.add_space(12.0);
-            if ui.button("View only").clicked() {
-                permissions = Permissions::VIEW_ONLY;
-            }
-        });
-        if permissions != app.settings.permissions {
-            app.settings.permissions = permissions;
-            app.host.set_permissions(permissions);
+        theme::section_title(ui, "Allowed by default");
+        ui.label(
+            RichText::new("Pre-selected when someone asks to connect, and what \"always allowed\" devices get.").weak(),
+        );
+        if permission_toggles(ui, &mut app.settings.permissions) {
+            app.host.set_default_permissions(app.settings.permissions);
         }
-        ui.label(RichText::new("Remote input arrives in a coming update; these settings apply once it does.").weak().small());
+        if app.settings.permissions.allows(DeviceClass::Gamepad)
+            && let Some(problem) = &gamepad_problem
+        {
+            gamepad_warning(ui, problem);
+        }
+        ui.label(
+            RichText::new(
+                "Windows keeps input away from programs running as administrator unless Connect runs as \
+                 administrator too.",
+            )
+            .weak()
+            .small(),
+        );
     });
     ui.add_space(6.0);
 
@@ -233,10 +249,36 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
 
+    if VideoSource::SCREEN_SUPPORTED {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title(ui, "Stream quality (when sharing this PC)");
+            ui.label(
+                RichText::new(
+                    "The most video data per second this PC sends. Higher looks sharper, especially at 120+ fps, \
+                     but needs a faster upload here. Applies from the next connection.",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                for mbps in BITRATE_CHOICES_MBPS {
+                    if ui.selectable_label(app.settings.bitrate_mbps == mbps, format!("{mbps} Mb/s")).clicked() {
+                        app.settings.bitrate_mbps = mbps;
+                        app.host.set_bitrate_mbps(mbps);
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::section_title(ui, "This PC");
+        theme::section_title(ui, "Account");
         ui.label(RichText::new(net::format_user_id(&app.endpoint.id())).monospace());
+        if ui.button("Copy User-ID").clicked() {
+            ui.ctx().copy_text(app.endpoint.id().to_string());
+        }
         ui.label(RichText::new(format!("Connect {}", env!("CARGO_PKG_VERSION"))).weak());
     });
 }

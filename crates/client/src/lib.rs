@@ -1,8 +1,9 @@
 //! The connecting side of a session.
 //!
 //! [`connect`] dials a host by User-ID, waits while the host user is asked to allow it, then
-//! receives and decodes the host's screen. Progress arrives as [`ClientEvent`]s; the newest
-//! decoded frame and live [`Stats`] are read from the [`ClientHandle`].
+//! receives and decodes the host's screen and sends input with [`ClientHandle::send_input`].
+//! Progress arrives as [`ClientEvent`]s; the newest decoded frame and live [`Stats`] are read
+//! from the [`ClientHandle`].
 
 mod video;
 
@@ -18,8 +19,9 @@ use std::{
 use anyhow::{Result, bail};
 use connect_net::{self as net, PathKind};
 use connect_proto::{
-    CLOSE_NORMAL, CLOSE_REJECTED, PROTOCOL_VERSION, Permissions,
+    CLOSE_NORMAL, CLOSE_REJECTED, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
+    input::InputEvent,
     now_micros,
     video::FrameMeta,
 };
@@ -48,6 +50,8 @@ pub enum ClientEvent {
     Accepted { host_name: String, width: u32, height: u32, permissions: Permissions },
     PermissionsChanged(Permissions),
     VideoFormat { width: u32, height: u32 },
+    /// The host can't use this kind of input even though it's allowed; the text says why.
+    InputUnavailable { device: DeviceClass, reason: String },
     /// Always the last event.
     Ended(EndReason),
 }
@@ -123,6 +127,8 @@ struct Shared {
     disconnect: Notify,
     disconnected: AtomicBool,
     conn: Mutex<Option<Connection>>,
+    /// Feeds the input stream while a session runs.
+    input: Mutex<Option<mpsc::UnboundedSender<InputEvent>>>,
     frame: Mutex<Option<VideoFrame>>,
     stats: Mutex<Stats>,
     counters: Counters,
@@ -154,6 +160,7 @@ pub fn connect(
         disconnect: Notify::new(),
         disconnected: AtomicBool::new(false),
         conn: Mutex::new(None),
+        input: Mutex::new(None),
         frame: Mutex::new(None),
         stats: Mutex::new(Stats::default()),
         counters: Counters {
@@ -182,6 +189,14 @@ impl ClientHandle {
 
     pub fn stats(&self) -> Stats {
         *lock(&self.0.stats)
+    }
+
+    /// Sends input to the host, in order. Dropped unless a session is running; the host also
+    /// drops anything its permissions don't allow.
+    pub fn send_input(&self, event: InputEvent) {
+        if let Some(tx) = &*lock(&self.0.input) {
+            let _ = tx.send(event);
+        }
     }
 
     /// Hangs up, or stops connecting. [`ClientEvent::Ended`] follows.
@@ -222,6 +237,7 @@ async fn run(endpoint: &Endpoint, host: EndpointAddr, client_name: &str, shared:
     }
 
     let result = session(&conn, client_name, shared, events).await;
+    *lock(&shared.input) = None;
     let reason = match (conn.close_reason(), result) {
         (_, Ok(Some(reason))) => reason,
         (Some(closed), _) => describe_close(&closed),
@@ -247,6 +263,11 @@ async fn session(conn: &Connection, client_name: &str, shared: &Arc<Shared>, eve
     };
     match reply {
         Ok(Some(HostMsg::Welcome { host_name, width, height, permissions })) => {
+            // Ready before `Accepted`, so input sent in response to it isn't dropped.
+            let input = conn.open_uni().await?;
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            tokio::spawn(write_input(input, input_rx));
+            *lock(&shared.input) = Some(input_tx);
             events.send(ClientEvent::Accepted { host_name, width, height, permissions }).await;
         }
         Ok(Some(HostMsg::Rejected { reason })) => return Ok(Some(EndReason::Rejected(reason))),
@@ -296,6 +317,9 @@ async fn stream(
                 Some(Ok(HostMsg::VideoFormat { width, height })) => {
                     events.send(ClientEvent::VideoFormat { width, height }).await;
                 }
+                Some(Ok(HostMsg::InputUnavailable { device, reason })) => {
+                    events.send(ClientEvent::InputUnavailable { device, reason }).await;
+                }
                 Some(Ok(HostMsg::Rejected { reason })) => return Ok(Some(EndReason::HostEnded(reason))),
                 Some(Ok(other @ HostMsg::Welcome { .. })) => bail!("unexpected message from host: {other:?}"),
                 Some(Err(e)) => return Err(e),
@@ -333,6 +357,15 @@ async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<Result<HostMsg>>) {
             }
         }
     }
+}
+
+async fn write_input(mut stream: SendStream, mut events: mpsc::UnboundedReceiver<InputEvent>) {
+    while let Some(event) = events.recv().await {
+        if let Err(e) = net::write_msg(&mut stream, &event).await {
+            return debug!("input stream closed: {e:#}");
+        }
+    }
+    let _ = stream.finish();
 }
 
 fn describe_close(error: &ConnectionError) -> EndReason {

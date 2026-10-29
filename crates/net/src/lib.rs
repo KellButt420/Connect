@@ -27,23 +27,34 @@ pub fn default_config_dir() -> Result<std::path::PathBuf> {
     Ok(dirs.config_dir().to_path_buf())
 }
 
-/// Loads this machine's identity from `dir`, generating and saving one on first run.
-pub fn load_or_create_identity(dir: &Path) -> Result<SecretKey> {
+/// Loads this machine's identity (its account) from `dir`; `None` if there isn't one yet.
+pub fn load_identity(dir: &Path) -> Result<Option<SecretKey>> {
     let path = dir.join(KEY_FILE);
     match std::fs::read(&path) {
         Ok(bytes) => {
             let bytes: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("{} is corrupt", path.display()))?;
-            Ok(SecretKey::from_bytes(&bytes))
+            Ok(Some(SecretKey::from_bytes(&bytes)))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            let key = SecretKey::generate();
-            write_private(&path, &key.to_bytes())?;
-            Ok(key)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Generates a new identity and saves it in `dir`. Fails rather than replace an existing one.
+pub fn create_identity(dir: &Path) -> Result<SecretKey> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let key = SecretKey::generate();
+    write_private(&dir.join(KEY_FILE), &key.to_bytes())?;
+    Ok(key)
+}
+
+/// Loads this machine's identity from `dir`, generating and saving one on first run.
+pub fn load_or_create_identity(dir: &Path) -> Result<SecretKey> {
+    match load_identity(dir)? {
+        Some(key) => Ok(key),
+        None => create_identity(dir),
     }
 }
 
@@ -60,7 +71,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         f.write_all(bytes)?;
     }
     #[cfg(not(unix))]
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(bytes)?;
+    }
     Ok(())
 }
 
@@ -207,9 +226,12 @@ mod tests {
     fn identity_persists() {
         let dir = std::env::temp_dir().join(format!("connect-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_identity(&dir).unwrap().is_none());
         let a = load_or_create_identity(&dir).unwrap();
         let b = load_or_create_identity(&dir).unwrap();
         assert_eq!(a.public(), b.public());
+        assert_eq!(load_identity(&dir).unwrap().unwrap().public(), a.public());
+        assert!(create_identity(&dir).is_err(), "an existing account is never overwritten");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,13 +1,18 @@
-//! The desktop app: Share / Connect / Settings pages, the Allow/Deny prompt, and the session view.
+//! The desktop app: first-run account setup, the Share / Connect / Settings pages, the
+//! Allow/Deny prompt, and the session view.
 
+mod gamepad;
+mod input;
 mod pages;
 mod prompt;
 mod session;
 mod settings;
 mod theme;
+mod welcome;
 
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,18 +25,26 @@ use connect_client::{ClientEvent, ClientHandle, Stage};
 use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle, VideoSource};
 use connect_net::{
     self as net,
-    iroh::{Endpoint, EndpointId, SecretKey},
+    iroh::{Endpoint, EndpointId},
 };
-use connect_proto::Permissions;
+use connect_proto::{DeviceClass, Permissions};
 use eframe::egui::{self, ViewportCommand};
-use tokio::{runtime::Runtime, sync::mpsc};
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::mpsc,
+};
 
 use settings::Settings;
+use welcome::Welcome;
 
-pub fn run(runtime: Runtime, key: SecretKey) -> Result<()> {
+pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     // Lets the UI thread start tasks on the runtime.
     let _guard = runtime.enter();
-    let endpoint = runtime.block_on(net::bind_endpoint(key))?;
+    // An existing account goes straight in; a new install first gets the welcome screen.
+    let endpoint = match net::load_identity(&config_dir)? {
+        Some(key) => Some(runtime.block_on(net::bind_endpoint(key))?),
+        None => None,
+    };
     // wgpu (Direct3D 12 / Vulkan / Metal) normally; plain OpenGL for machines where that fails,
     // such as old GPUs and some VMs.
     let renderer = match std::env::var("CONNECT_RENDERER").as_deref() {
@@ -46,8 +59,58 @@ pub fn run(runtime: Runtime, key: SecretKey) -> Result<()> {
         renderer,
         ..Default::default()
     };
-    eframe::run_native("Connect", options, Box::new(|cc| Ok(Box::new(App::new(cc, endpoint)))))
+    let handle = runtime.handle().clone();
+    eframe::run_native("Connect", options, Box::new(|cc| Ok(Box::new(Root::new(cc, handle, config_dir, endpoint)))))
         .map_err(|e| anyhow::anyhow!("couldn't open the window: {e}"))
+}
+
+/// The welcome screen until an account exists, then the app proper.
+struct Root {
+    screen: Screen,
+}
+
+enum Screen {
+    Welcome(Welcome),
+    Main(Box<App>),
+}
+
+impl Root {
+    fn new(cc: &eframe::CreationContext<'_>, runtime: Handle, config_dir: PathBuf, endpoint: Option<Endpoint>) -> Self {
+        theme::apply(&cc.egui_ctx);
+        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        let screen = match endpoint {
+            Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings))),
+            None => Screen::Welcome(Welcome::new(runtime, config_dir, settings)),
+        };
+        Self { screen }
+    }
+}
+
+impl eframe::App for Root {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Screen::Main(app) = &mut self.screen {
+            app.logic(ctx);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        match &mut self.screen {
+            Screen::Welcome(welcome) => {
+                if let Some((endpoint, settings)) = welcome.show(ui) {
+                    self.screen = Screen::Main(Box::new(App::new(ui.ctx(), endpoint, settings)));
+                }
+            }
+            Screen::Main(app) => app.ui(ui),
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let settings = match &self.screen {
+            Screen::Welcome(welcome) => &welcome.settings,
+            Screen::Main(app) => &app.settings,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, settings);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,9 +126,11 @@ pub struct App {
     settings: Settings,
     host: HostHandle,
     host_events: mpsc::UnboundedReceiver<HostEvent>,
+    /// Whether this PC can give a remote user a gamepad; `Err` says why not.
+    gamepad_support: Result<(), String>,
     /// Connection requests waiting for Allow/Deny, oldest first.
     requests: VecDeque<Request>,
-    /// Who is viewing this PC right now.
+    /// Who is using this PC right now.
     hosting: Option<Hosting>,
     page: Page,
     connect_input: String,
@@ -78,12 +143,15 @@ struct Request {
     inner: ConnectionRequest,
     arrived: Instant,
     always_allow: bool,
+    /// What they'll be able to use if allowed; starts from the defaults.
+    permissions: Permissions,
 }
 
 struct Hosting {
     peer: EndpointId,
     client_name: String,
     since: Instant,
+    permissions: Permissions,
 }
 
 struct Notice {
@@ -100,6 +168,16 @@ struct ClientSession {
     state: ClientState,
     video: Option<egui::TextureHandle>,
     show_stats: bool,
+    input: input::InputCapture,
+    gamepads: Option<gamepad::Forwarder>,
+    /// A short message over the video, e.g. that the host changed permissions.
+    note: Option<(String, Instant)>,
+}
+
+impl ClientSession {
+    fn note(&mut self, text: impl Into<String>, for_secs: u64) {
+        self.note = Some((text.into(), Instant::now() + Duration::from_secs(for_secs)));
+    }
 }
 
 enum ClientState {
@@ -109,13 +187,10 @@ enum ClientState {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, endpoint: Endpoint) -> Self {
-        theme::apply(&cc.egui_ctx);
-        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
-
+    fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings) -> Self {
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
-            let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), cc.egui_ctx.clone());
+            let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());
             async move {
                 endpoint.online().await;
                 online.store(true, Ordering::Relaxed);
@@ -127,18 +202,22 @@ impl App {
             endpoint.clone(),
             HostConfig {
                 accepting: settings.accepting,
-                permissions: settings.permissions,
+                default_permissions: settings.permissions,
                 trusted: settings.trusted_ids(),
+                bitrate_mbps: settings.bitrate_mbps,
                 ..HostConfig::new(settings.device_name.clone())
             },
         );
+        let gamepad_support =
+            if VideoSource::SCREEN_SUPPORTED { connect_host::gamepad_support() } else { Ok(()) };
 
         Self {
             endpoint,
             online,
             settings,
             host,
-            host_events: forward_host_events(events, cc.egui_ctx.clone()),
+            host_events: forward_host_events(events, ctx.clone()),
+            gamepad_support,
             requests: VecDeque::new(),
             hosting: None,
             // Only Windows can host; elsewhere the host just turns callers away with the reason.
@@ -155,11 +234,14 @@ impl App {
 
     fn on_host_event(&mut self, event: HostEvent) {
         match event {
-            HostEvent::Request(inner) => {
-                self.requests.push_back(Request { inner, arrived: Instant::now(), always_allow: false })
-            }
-            HostEvent::SessionStarted { peer, client_name } => {
-                self.hosting = Some(Hosting { peer, client_name, since: Instant::now() });
+            HostEvent::Request(inner) => self.requests.push_back(Request {
+                inner,
+                arrived: Instant::now(),
+                always_allow: false,
+                permissions: self.settings.permissions,
+            }),
+            HostEvent::SessionStarted { peer, client_name, permissions } => {
+                self.hosting = Some(Hosting { peer, client_name, since: Instant::now(), permissions });
             }
             HostEvent::SessionEnded { reason, .. } => {
                 self.hosting = None;
@@ -187,6 +269,9 @@ impl App {
             state: ClientState::Connecting,
             video: None,
             show_stats: false,
+            input: input::InputCapture::default(),
+            gamepads: None,
+            note: None,
         });
         self.notice = None;
     }
@@ -200,18 +285,29 @@ impl App {
                 ClientEvent::Stage(Stage::WaitingForApproval) => client.state = ClientState::WaitingForApproval,
                 ClientEvent::Accepted { host_name, permissions, .. } => {
                     self.settings.add_recent(client.host_id, &host_name);
+                    client.note(format!("Connected. You can use: {}.", describe(permissions)), 5);
                     client.state = ClientState::Connected { host_name, permissions };
+                    client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone()));
                 }
-                ClientEvent::PermissionsChanged(p) => {
+                ClientEvent::PermissionsChanged(now) => {
                     if let ClientState::Connected { permissions, .. } = &mut client.state {
-                        *permissions = p;
+                        let before = std::mem::replace(permissions, now);
+                        client.input.permissions_changed(now);
+                        if !now.allows(DeviceClass::Mouse) {
+                            session::set_captured(ctx, client, false);
+                        }
+                        if before != now {
+                            client.note(permission_change(before, now), 5);
+                        }
                     }
                 }
+                ClientEvent::InputUnavailable { reason, .. } => client.note(reason, 10),
                 ClientEvent::VideoFormat { .. } => {}
                 ClientEvent::Ended(reason) => ended = Some(reason),
             }
         }
         if let Some(reason) = ended {
+            session::set_captured(ctx, client, false);
             let is_error = !matches!(reason, connect_client::EndReason::Disconnected);
             self.client = None;
             self.page = Page::Connect;
@@ -221,10 +317,8 @@ impl App {
             }
         }
     }
-}
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.host_events.try_recv() {
             self.on_host_event(event);
         }
@@ -235,16 +329,19 @@ impl eframe::App for App {
         }
         self.poll_client(ctx);
 
-        // Countdown on the prompt, and the elapsed timers while connecting or hosting.
+        // Countdown on the prompt, the elapsed timers, and notes fading out over the video.
         let waiting = self.client.as_ref().is_some_and(|c| !matches!(c.state, ClientState::Connected { .. }));
         if !self.requests.is_empty() || waiting {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else if self.hosting.is_some() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        if let Some((_, until)) = self.client.as_ref().and_then(|c| c.note.as_ref()) {
+            ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+        }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         if self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. })) {
             session::show(self, ui);
         } else {
@@ -261,10 +358,26 @@ impl eframe::App for App {
         }
         prompt::show(self, ui.ctx());
     }
+}
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+/// "mouse, keyboard and gamepad", or "only the screen (view only)".
+fn describe(permissions: Permissions) -> String {
+    let names: Vec<String> =
+        DeviceClass::ALL.into_iter().filter(|d| permissions.allows(*d)).map(|d| d.label().to_lowercase()).collect();
+    match names.as_slice() {
+        [] => "nothing, view only".into(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+fn permission_change(before: Permissions, now: Permissions) -> String {
+    let changed: Vec<String> = DeviceClass::ALL
+        .into_iter()
+        .filter(|d| before.allows(*d) != now.allows(*d))
+        .map(|d| format!("{} {}", d.label(), if now.allows(d) { "on" } else { "off" }))
+        .collect();
+    format!("The host turned {}.", changed.join(", "))
 }
 
 /// Passes host events to the UI, waking it and bringing the window forward for a request,

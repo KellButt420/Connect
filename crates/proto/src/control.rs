@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::Permissions;
+use crate::{DeviceClass, Permissions};
 
 /// Upper bound on a single control message; anything larger is a protocol violation.
 pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
@@ -30,6 +30,9 @@ pub enum HostMsg {
     /// The captured screen changed size; subsequent frames use this resolution.
     VideoFormat { width: u32, height: u32 },
     Pong { client_time_us: u64, host_time_us: u64 },
+    /// The host can't act on this kind of input even though it's allowed, e.g. the gamepad
+    /// driver is missing. The text says why.
+    InputUnavailable { device: DeviceClass, reason: String },
 }
 
 /// Serialises `msg` with its length prefix, ready to write to the stream.

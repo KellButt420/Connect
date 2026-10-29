@@ -1,13 +1,14 @@
-//! Host ↔ client over two localhost endpoints: the approval flow, then video.
+//! Host ↔ client over two localhost endpoints: the approval flow, then video and input.
 
 use std::time::Duration;
 
 use connect_client::{ClientEvent, ClientHandle, EndReason, Stage};
-use connect_host::{Decision, HostConfig, HostEvent, HostHandle, VideoSource};
+use connect_host::{Decision, HostConfig, HostEvent, HostHandle, InputSink, VideoSource};
 use connect_net::{self as net, iroh::Endpoint};
 use connect_proto::{
-    ALPN,
+    ALPN, DeviceClass, Permissions,
     control::{ClientMsg, HostMsg},
+    input::{GamepadState, InputEvent, MouseButton},
     video::FrameAssembler,
 };
 use iroh::{
@@ -103,7 +104,7 @@ async fn allow_streams_video() {
     let (host_ep, _host, mut host_events) = start_host(config()).await;
     let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
 
-    request(&mut host_events).await.respond(Decision::Allow);
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     assert_eq!(accepted(&mut client_events).await, ("Test host".into(), 320, 240));
     assert!(matches!(next(&mut host_events).await, HostEvent::SessionStarted { .. }));
 
@@ -145,7 +146,7 @@ async fn trusted_peer_needs_no_prompt() {
 async fn second_client_is_told_host_is_busy() {
     let (host_ep, host, mut host_events) = start_host(config()).await;
     let (first_ep, _first, mut first_events) = start_client(&host_ep).await;
-    request(&mut host_events).await.respond(Decision::Allow);
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     accepted(&mut first_events).await;
     assert_eq!(host.current_peer(), Some(first_ep.id()));
 
@@ -165,6 +166,70 @@ async fn not_accepting_turns_everyone_away() {
         ended(&mut client_events).await,
         EndReason::Rejected("The host isn't accepting connections right now.".into())
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chosen_permissions_reach_the_client() {
+    let (host_ep, host, mut host_events) = start_host(config()).await;
+    let (_client_ep, _client, mut client_events) = start_client(&host_ep).await;
+    let mouse_only = Permissions::VIEW_ONLY.with(DeviceClass::Mouse, true);
+    request(&mut host_events).await.respond(Decision::Allow(mouse_only));
+
+    let granted = loop {
+        match next(&mut client_events).await {
+            ClientEvent::Accepted { permissions, .. } => break permissions,
+            ClientEvent::Ended(reason) => panic!("ended before being accepted: {reason}"),
+            _ => {}
+        }
+    };
+    assert_eq!(granted, mouse_only);
+    match next(&mut host_events).await {
+        HostEvent::SessionStarted { permissions, .. } => assert_eq!(permissions, mouse_only),
+        other => panic!("expected the session to start, got {other:?}"),
+    }
+    assert_eq!(host.permissions(), mouse_only);
+
+    host.set_permissions(Permissions::ALL);
+    loop {
+        match next(&mut client_events).await {
+            ClientEvent::PermissionsChanged(p) => break assert_eq!(p, Permissions::ALL),
+            ClientEvent::Ended(reason) => panic!("ended early: {reason}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn input_obeys_permissions_and_is_released() {
+    let (sink, mut injected) = mpsc::unbounded_channel();
+    let (host_ep, host, mut host_events) =
+        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+    let no_gamepad = Permissions::ALL.with(DeviceClass::Gamepad, false);
+    request(&mut host_events).await.respond(Decision::Allow(no_gamepad));
+    accepted(&mut client_events).await;
+
+    let w_down = InputEvent::Key { scancode: 0x11, down: true };
+    let click = InputEvent::MouseButton { button: MouseButton::Left, down: true };
+    let pad = GamepadState { buttons: GamepadState::A, ..GamepadState::NEUTRAL };
+    client.send_input(w_down);
+    client.send_input(InputEvent::Gamepad { pad: 0, state: pad }); // gamepad not allowed
+    client.send_input(InputEvent::Key { scancode: 0, down: true }); // malformed
+    client.send_input(click);
+    let mut injected_next = async || timeout(WAIT, injected.recv()).await.expect("input arrives").unwrap();
+    assert_eq!(injected_next().await, w_down);
+    assert_eq!(injected_next().await, click);
+
+    // Turning the keyboard off lets go of W straight away, and stops further keys.
+    host.set_permissions(no_gamepad.with(DeviceClass::Keyboard, false));
+    assert_eq!(injected_next().await, InputEvent::Key { scancode: 0x11, down: false });
+    client.send_input(InputEvent::Key { scancode: 0x1E, down: true });
+
+    // Ending the session lets go of the mouse button.
+    client.disconnect();
+    assert_eq!(injected_next().await, InputEvent::MouseButton { button: MouseButton::Left, down: false });
+    let extra = timeout(Duration::from_millis(300), injected.recv()).await;
+    assert!(!matches!(extra, Ok(Some(_))), "unexpected input: {extra:?}");
 }
 
 #[cfg(not(windows))]
@@ -228,7 +293,7 @@ async fn version_mismatch_is_rejected() {
 async fn keyframe_request_is_honoured() {
     let (host_ep, _host, mut host_events) = start_host(config()).await;
     let Raw { _ep, conn, mut send, mut recv } = raw_hello(&host_ep, connect_proto::PROTOCOL_VERSION).await;
-    request(&mut host_events).await.respond(Decision::Allow);
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     assert!(matches!(read_reply(&mut recv).await, Some(HostMsg::Welcome { .. })));
 
     let mut asm = FrameAssembler::new();

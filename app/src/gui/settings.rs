@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Hosts remembered on the Connect page.
 const MAX_RECENT: usize = 8;
 
+/// Offered caps on the video bitrate when sharing.
+pub const BITRATE_CHOICES_MBPS: [u32; 5] = [10, 20, 35, 50, 80];
+
 /// Everything the app remembers between runs.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -14,7 +17,10 @@ pub struct Settings {
     /// Shown to the other side.
     pub device_name: String,
     pub accepting: bool,
+    /// Pre-selected in the Allow prompt, and what trusted devices get.
     pub permissions: Permissions,
+    /// Cap on the video bitrate when sharing.
+    pub bitrate_mbps: u32,
     /// Devices let in without asking.
     pub trusted: Vec<KnownDevice>,
     /// Hosts connected to, most recent first.
@@ -44,6 +50,7 @@ impl Default for Settings {
             device_name: crate::device_name(),
             accepting: true,
             permissions: Permissions::default(),
+            bitrate_mbps: connect_host::DEFAULT_BITRATE_MBPS,
             trusted: Vec::new(),
             recent: Vec::new(),
         }

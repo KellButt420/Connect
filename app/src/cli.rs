@@ -7,17 +7,28 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use connect_client::{ClientEvent, Stage};
-use connect_host::{Decision, HostConfig, HostEvent, VideoSource};
+use connect_host::{Decision, HostConfig, HostEvent, InputSink, VideoSource};
 use connect_net::{self as net, iroh::SecretKey};
+use connect_proto::Permissions;
 use tokio::sync::mpsc;
 
 use crate::{device_name, stats_line};
 
 pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     let mut video = VideoSource::default();
+    let mut input = InputSink::default();
     for arg in args {
         match arg.as_str() {
             "--test-pattern" => video = VideoSource::TEST_PATTERN,
+            "--print-input" => {
+                let (tx, mut events) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        println!("input: {event:?}");
+                    }
+                });
+                input = InputSink::Channel(tx);
+            }
             other => bail!("unknown option {other:?} for `connect host`"),
         }
     }
@@ -33,7 +44,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
         Err(_) => println!("no relay reachable yet; only direct connections will work for now."),
     }
 
-    let (_host, mut events) = connect_host::start(endpoint.clone(), HostConfig { video, ..HostConfig::new(device_name()) });
+    let (_host, mut events) = connect_host::start(endpoint.clone(), HostConfig { video, input, ..HostConfig::new(device_name()) });
     let mut lines = stdin_lines();
 
     loop {
@@ -61,7 +72,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
                     Some(line) if request.is_pending() => {
                         let allow = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
                         println!("{}", if allow { "Allowed." } else { "Denied." });
-                        request.respond(if allow { Decision::Allow } else { Decision::Deny });
+                        request.respond(if allow { Decision::Allow(Permissions::ALL) } else { Decision::Deny });
                     }
                     _ => println!("The request expired or was withdrawn."),
                 }
@@ -110,6 +121,7 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 }
                 Some(ClientEvent::PermissionsChanged(p)) => println!("Host changed permissions to {:#05b}.", p.bits()),
                 Some(ClientEvent::VideoFormat { width, height }) => println!("Host screen is now {width}×{height}."),
+                Some(ClientEvent::InputUnavailable { reason, .. }) => println!("{reason}"),
                 Some(ClientEvent::Ended(reason)) => {
                     println!("{reason}");
                     break;

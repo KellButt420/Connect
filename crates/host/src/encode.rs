@@ -23,8 +23,9 @@ use tokio::sync::mpsc;
 
 use crate::capture::{Frame, VideoSource};
 
-const BITRATE_BPS: u32 = 20_000_000;
-const MAX_FPS: f32 = 60.0;
+/// Above any display's refresh rate: capture only yields a frame when the screen changes, so the
+/// stream runs at whatever rate the host's monitor and content do (60, 120, 144, 240 Hz…).
+const MAX_FPS: f32 = 240.0;
 /// A keyframe at least this often, in case a keyframe request is lost along with the video.
 const INTRA_PERIOD_FRAMES: u32 = 600;
 /// How long one capture wait may block, so a stop request is noticed promptly.
@@ -44,7 +45,7 @@ pub(crate) struct VideoStream {
 }
 
 impl VideoStream {
-    pub fn start(source: VideoSource) -> Result<Self> {
+    pub fn start(source: VideoSource, bitrate_bps: u32) -> Result<Self> {
         // Small, so a slow network pushes back on the encoder instead of queueing stale frames.
         let (tx, events) = mpsc::channel(2);
         let keyframe = Arc::new(AtomicBool::new(false));
@@ -53,7 +54,7 @@ impl VideoStream {
         std::thread::Builder::new()
             .name("connect-video".into())
             .spawn(move || {
-                if let Err(e) = run(&source, &tx, &kf, &st) {
+                if let Err(e) = run(&source, bitrate_bps, &tx, &kf, &st) {
                     let _ = tx.blocking_send(Err(e));
                 }
             })
@@ -78,11 +79,11 @@ impl Drop for VideoStream {
     }
 }
 
-fn encoder_config() -> EncoderConfig {
+fn encoder_config(bitrate_bps: u32) -> EncoderConfig {
     EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
-        .bitrate(BitRate::from_bps(BITRATE_BPS))
+        .bitrate(BitRate::from_bps(bitrate_bps))
         .max_frame_rate(FrameRate::from_hz(MAX_FPS))
         // Rate control can only hold the bitrate if it may drop a frame when over budget.
         .skip_frames(true)
@@ -94,13 +95,14 @@ fn encoder_config() -> EncoderConfig {
 
 fn run(
     source: &VideoSource,
+    bitrate_bps: u32,
     tx: &mpsc::Sender<Result<VideoEvent>>,
     keyframe: &AtomicBool,
     stop: &AtomicBool,
 ) -> Result<()> {
     let mut capturer = source.open()?;
     let mut encoder =
-        Encoder::with_api_config(OpenH264API::from_source(), encoder_config()).context("starting H.264 encoder")?;
+        Encoder::with_api_config(OpenH264API::from_source(), encoder_config(bitrate_bps)).context("starting H.264 encoder")?;
     // The last captured image, kept so a keyframe can be sent while the screen is static.
     let mut yuv: Option<YUVBuffer> = None;
     let mut packed = Vec::new();

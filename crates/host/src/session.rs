@@ -1,6 +1,9 @@
 //! One incoming connection: handshake, approval, then streaming until either side hangs up.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use connect_net as net;
@@ -19,6 +22,7 @@ use tracing::{debug, info, warn};
 use crate::{
     ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
     encode::{VideoEvent, VideoStream},
+    input::{self, Unavailable},
 };
 
 /// How long a new connection may take to say hello.
@@ -72,16 +76,19 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         return reject(conn, &mut send, BUSY).await;
     };
 
-    if !shared.is_trusted(&peer) {
+    let granted = if shared.is_trusted(&peer) {
+        shared.default_permissions()
+    } else {
         match ask(conn, shared, events, &client_name).await {
-            Answer::Decided(Decision::Allow) => {}
+            Answer::Decided(Decision::Allow(permissions)) => permissions,
             Answer::Decided(Decision::Deny) => return reject(conn, &mut send, DECLINED).await,
             Answer::TimedOut => return reject(conn, &mut send, NO_ANSWER).await,
             Answer::Withdrawn => return Ok(()),
         }
-    }
+    };
 
-    let mut video = VideoStream::start(shared.video.clone())?;
+    let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
+    let mut video = VideoStream::start(shared.video.clone(), bitrate_bps)?;
     let (width, height) = match video.next().await {
         Some(Ok(VideoEvent::Format { width, height })) => (width, height),
         Some(Err(e)) => {
@@ -91,14 +98,19 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         _ => return reject(conn, &mut send, NO_CAPTURE).await,
     };
 
+    shared.permissions.send_replace(granted);
     let permissions = shared.permissions.subscribe();
-    let welcome =
-        HostMsg::Welcome { host_name: shared.host_name(), width, height, permissions: *permissions.borrow() };
+    let welcome = HostMsg::Welcome { host_name: shared.host_name(), width, height, permissions: granted };
     net::write_msg(&mut send, &welcome).await?;
-    info!(peer = %peer.fmt_short(), %client_name, width, height, "session started");
-    let _ = events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone() }).await;
+    info!(peer = %peer.fmt_short(), %client_name, width, height, ?granted, "session started");
+    let _ = events
+        .send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted })
+        .await;
 
-    let result = stream(conn, send, recv, video, permissions).await;
+    let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
+    tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
+
+    let result = stream(conn, send, recv, video, permissions, unavailable).await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -148,6 +160,7 @@ async fn stream(
     recv: RecvStream,
     mut video: VideoStream,
     mut permissions: watch::Receiver<Permissions>,
+    mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
 ) -> Result<()> {
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (msg_tx, mut msgs) = mpsc::channel(16);
@@ -171,6 +184,9 @@ async fn stream(
             Ok(()) = permissions.changed() => {
                 let p = *permissions.borrow_and_update();
                 net::write_msg(&mut send, &HostMsg::PermissionsChanged(p)).await?;
+            }
+            Some(Unavailable { device, reason }) = unavailable.recv() => {
+                net::write_msg(&mut send, &HostMsg::InputUnavailable { device, reason }).await?;
             }
             event = video.next() => match event {
                 Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame)?,

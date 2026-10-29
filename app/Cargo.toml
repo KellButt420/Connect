@@ -12,6 +12,7 @@ connect-net.workspace = true
 connect-proto.workspace = true
 eframe = { version = "0.37", features = ["persistence", "glow"] }
 gethostname = "1"
+gilrs = "0.11.2"
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,18 +1,20 @@
 //! The sharing side of a session.
 //!
 //! [`start`] accepts connections on the app's endpoint. For each one the host user is asked to
-//! allow or deny it (unless the caller's User-ID is trusted); an allowed peer then gets the
-//! screen as H.264 over QUIC datagrams. One session runs at a time.
+//! allow or deny it (unless the caller's User-ID is trusted), choosing which input devices they
+//! may use; an allowed peer then gets the screen as H.264 over QUIC datagrams and may drive the
+//! permitted devices. One session runs at a time.
 
 mod capture;
 mod encode;
+mod input;
 mod session;
 
 use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -22,8 +24,12 @@ use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use capture::VideoSource;
+pub use input::{GAMEPAD_DRIVER_URL, InputSink, gamepad_support};
 
-/// What the host starts with. Everything except `video` and `approval_timeout` can be
+/// Default cap on the video bitrate.
+pub const DEFAULT_BITRATE_MBPS: u32 = 20;
+
+/// What the host starts with. Everything except `video`, `input` and `approval_timeout` can be
 /// changed later through [`HostHandle`].
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -31,10 +37,15 @@ pub struct HostConfig {
     pub host_name: String,
     /// When false, every connection is turned away without asking.
     pub accepting: bool,
-    pub permissions: Permissions,
+    /// What a trusted device may use, since it isn't asked about; prompted connections get
+    /// whatever the host user picks in [`Decision::Allow`].
+    pub default_permissions: Permissions,
     /// User-IDs that are let in without asking.
     pub trusted: HashSet<EndpointId>,
+    /// Upper bound on the video bitrate, in megabits per second; applies from the next session.
+    pub bitrate_mbps: u32,
     pub video: VideoSource,
+    pub input: InputSink,
     pub approval_timeout: Duration,
 }
 
@@ -43,9 +54,11 @@ impl HostConfig {
         Self {
             host_name: host_name.into(),
             accepting: true,
-            permissions: Permissions::default(),
+            default_permissions: Permissions::default(),
             trusted: HashSet::new(),
+            bitrate_mbps: DEFAULT_BITRATE_MBPS,
             video: VideoSource::default(),
+            input: InputSink::default(),
             approval_timeout: APPROVAL_TIMEOUT,
         }
     }
@@ -54,7 +67,9 @@ impl HostConfig {
 /// The host user's answer to a [`ConnectionRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    Allow,
+    /// Let them in, able to use these input devices (changeable later with
+    /// [`HostHandle::set_permissions`]).
+    Allow(Permissions),
     Deny,
 }
 
@@ -83,7 +98,7 @@ impl ConnectionRequest {
 #[derive(Debug)]
 pub enum HostEvent {
     Request(ConnectionRequest),
-    SessionStarted { peer: EndpointId, client_name: String },
+    SessionStarted { peer: EndpointId, client_name: String, permissions: Permissions },
     SessionEnded { peer: EndpointId, reason: String },
 }
 
@@ -94,11 +109,15 @@ pub struct HostHandle(Arc<Shared>);
 struct Shared {
     host_name: RwLock<String>,
     accepting: AtomicBool,
+    default_permissions: RwLock<Permissions>,
+    /// The running session's permissions; reset when a session starts.
     permissions: watch::Sender<Permissions>,
     trusted: RwLock<HashSet<EndpointId>>,
+    bitrate_mbps: AtomicU32,
     /// The one connection being asked about or served; anyone else is told the host is busy.
     slot: Mutex<Option<(EndpointId, Connection)>>,
     video: VideoSource,
+    input: InputSink,
     approval_timeout: Duration,
 }
 
@@ -107,10 +126,13 @@ pub fn start(endpoint: Endpoint, config: HostConfig) -> (HostHandle, mpsc::Recei
     let shared = Arc::new(Shared {
         host_name: RwLock::new(config.host_name),
         accepting: AtomicBool::new(config.accepting),
-        permissions: watch::Sender::new(config.permissions),
+        default_permissions: RwLock::new(config.default_permissions),
+        permissions: watch::Sender::new(config.default_permissions),
         trusted: RwLock::new(config.trusted),
+        bitrate_mbps: AtomicU32::new(config.bitrate_mbps),
         slot: Mutex::new(None),
         video: config.video,
+        input: config.input,
         approval_timeout: config.approval_timeout,
     });
     let (events_tx, events_rx) = mpsc::channel(16);
@@ -138,13 +160,25 @@ impl HostHandle {
         self.0.accepting.load(Ordering::Relaxed)
     }
 
-    /// Changes which input devices the remote user may use, and tells the live session.
+    /// Changes which input devices the connected user may use, effective at once: anything they
+    /// hold on a device that's turned off is released.
     pub fn set_permissions(&self, permissions: Permissions) {
         self.0.permissions.send_replace(permissions);
     }
 
+    /// The connected user's current permissions.
     pub fn permissions(&self) -> Permissions {
         *self.0.permissions.borrow()
+    }
+
+    /// What trusted devices, which aren't asked about, may use from their next session.
+    pub fn set_default_permissions(&self, permissions: Permissions) {
+        *self.0.default_permissions.write().unwrap_or_else(PoisonError::into_inner) = permissions;
+    }
+
+    /// Caps the video bitrate from the next session on.
+    pub fn set_bitrate_mbps(&self, mbps: u32) {
+        self.0.bitrate_mbps.store(mbps.max(1), Ordering::Relaxed);
     }
 
     pub fn set_trusted(&self, peer: EndpointId, trusted: bool) {
@@ -172,6 +206,10 @@ impl HostHandle {
 impl Shared {
     fn host_name(&self) -> String {
         self.host_name.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn default_permissions(&self) -> Permissions {
+        *self.default_permissions.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn is_trusted(&self, peer: &EndpointId) -> bool {
