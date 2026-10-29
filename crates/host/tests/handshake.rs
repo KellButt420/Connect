@@ -20,10 +20,7 @@ use tokio::{sync::mpsc, time::timeout};
 const WAIT: Duration = Duration::from_secs(20);
 
 fn config() -> HostConfig {
-    HostConfig {
-        video: VideoSource::TestPattern { width: 320, height: 240, fps: 30 },
-        ..HostConfig::new("Test host")
-    }
+    HostConfig { video: VideoSource::TestPattern { width: 320, height: 240, fps: 30 }, ..HostConfig::new("Test host") }
 }
 
 async fn endpoint() -> Endpoint {
@@ -143,6 +140,39 @@ async fn trusted_peer_needs_no_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn high_refresh_video_decodes_over_datagrams() {
+    for fps in [120, 240] {
+        let mut cfg = config();
+        cfg.video = VideoSource::TestPattern { width: 640, height: 360, fps };
+        let (host_ep, host, mut host_events) = start_host(cfg).await;
+        let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+        request(&mut host_events).await.respond(Decision::Allow(Permissions::VIEW_ONLY));
+        accepted(&mut client_events).await;
+
+        timeout(WAIT, async {
+            let mut previous = None;
+            let mut received = 0;
+            while received < 20 {
+                if let Some(frame) = client.take_frame() {
+                    assert_eq!((frame.width, frame.height), (640, 360));
+                    assert_eq!(frame.rgba.len(), 640 * 360 * 4);
+                    assert!(previous.is_none_or(|seq| frame.meta.seq > seq));
+                    previous = Some(frame.meta.seq);
+                    received += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("high-refresh video keeps decoding");
+
+        client.disconnect();
+        assert_eq!(ended(&mut client_events).await, EndReason::Disconnected);
+        timeout(WAIT, host.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn second_client_is_told_host_is_busy() {
     let (host_ep, host, mut host_events) = start_host(config()).await;
     let (first_ep, _first, mut first_events) = start_client(&host_ep).await;
@@ -151,7 +181,10 @@ async fn second_client_is_told_host_is_busy() {
     assert_eq!(host.current_peer(), Some(first_ep.id()));
 
     let (_second_ep, _second, mut second_events) = start_client(&host_ep).await;
-    assert_eq!(ended(&mut second_events).await, EndReason::Rejected("The host is in another session right now.".into()));
+    assert_eq!(
+        ended(&mut second_events).await,
+        EndReason::Rejected("The host is in another session right now.".into())
+    );
 
     host.disconnect();
     assert_eq!(ended(&mut first_events).await, EndReason::HostEnded("The host ended the session.".into()));
@@ -202,8 +235,7 @@ async fn chosen_permissions_reach_the_client() {
 #[tokio::test(flavor = "multi_thread")]
 async fn input_obeys_permissions_and_is_released() {
     let (sink, mut injected) = mpsc::unbounded_channel();
-    let (host_ep, host, mut host_events) =
-        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
     let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
     let no_gamepad = Permissions::ALL.with(DeviceClass::Gamepad, false);
     request(&mut host_events).await.respond(Decision::Allow(no_gamepad));
@@ -235,8 +267,7 @@ async fn input_obeys_permissions_and_is_released() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_releases_input_before_returning() {
     let (sink, mut injected) = mpsc::unbounded_channel();
-    let (host_ep, host, mut host_events) =
-        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
     let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
     request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     accepted(&mut client_events).await;

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
-const RELEASES_API: &str = "https://api.github.com/repos/volsatl9/Connect/releases?per_page=20";
+const RELEASES_API: &str = "https://api.github.com/repos/KellButt420/Connect/releases?per_page=20";
 const SUMS_FILE: &str = "SHA256SUMS.txt";
 #[cfg(windows)]
 const ASSET: &str = "connect.exe";

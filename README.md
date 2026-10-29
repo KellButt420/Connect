@@ -1,5 +1,10 @@
 # Connect
 
+Performance fork of [volsatl9/Connect](https://github.com/volsatl9/Connect). This fork enables
+parallel software encoding, includes high-refresh streaming regression tests, and uses its
+own release channel for app updates. The protocol remains compatible with upstream v0.2.1.
+See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
+
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
 Account** to get a User-ID. Give it to someone and they can connect to your PC from anywhere:
 direct P2P when possible, through a relay when not. You allow or deny every connection, and choose
@@ -19,7 +24,8 @@ Grab the latest build from [Releases](../../releases):
 
 - `connect.exe`: Windows 10 / 11. It's unsigned, so SmartScreen asks first: **More info → Run anyway**.
   Allow it through the firewall so direct connections work.
-- `connect-linux-x86_64`: Linux with glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13 or newer).
+- This fork currently publishes a Windows build. Linux can be built from source; the upstream
+  project also publishes Linux builds.
 
 Connect updates itself: when a new release is out it shows **Update available**, and **Update now**
 downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
@@ -52,12 +58,22 @@ All other keys, including F-keys and Esc, go to the host.
 Windows builds are cross-compiled from Linux (Ubuntu 24.04):
 
 ```sh
-sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu -p connect   # Windows
 cargo build --release -p connect                                    # Linux
 cargo test --workspace
 ```
+
+NASM is needed at build time for OpenH264's assembly optimizations. Without it, the dependency
+silently falls back to slower C++ code. On native Windows builds, use the Visual Studio C++
+toolchain and put `nasm.exe` on PATH, or set the `NASM` environment variable to its full path.
+If OpenH264 was already built without NASM, run `cargo clean -p openh264-sys2 --release`
+before rebuilding the release executable (omit `--release` for a dev/test build).
+
+The software encoder uses multiple slices and up to four workers to reduce frame processing
+stalls while keeping CPU use bounded. See [performance notes](PERFORMANCE.md) for verification
+and remaining limits.
 
 ## Headless commands
 
