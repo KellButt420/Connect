@@ -1,0 +1,18 @@
+[package]
+name = "connect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+connect-client.workspace = true
+connect-host.workspace = true
+connect-net.workspace = true
+connect-proto.workspace = true
+eframe = { version = "0.37", features = ["persistence", "glow"] }
+gethostname = "1"
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

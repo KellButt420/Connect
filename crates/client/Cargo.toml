@@ -1,0 +1,14 @@
+[package]
+name = "connect-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+connect-net.workspace = true
+connect-proto.workspace = true
+iroh.workspace = true
+openh264.workspace = true
+tokio.workspace = true
+tracing.workspace = true

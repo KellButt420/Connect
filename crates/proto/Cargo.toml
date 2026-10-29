@@ -1,0 +1,11 @@
+[package]
+name = "connect-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
