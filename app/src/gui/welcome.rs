@@ -15,16 +15,26 @@ pub struct Welcome {
     pub settings: Settings,
     /// Set once the account exists; the next screen shows its User-ID.
     created: Option<Endpoint>,
+    /// Install the built-in gamepad driver along with the account (Windows only).
+    setup_gamepads: bool,
     error: Option<String>,
 }
 
 impl Welcome {
     pub fn new(runtime: Handle, config_dir: PathBuf, settings: Settings) -> Self {
-        Self { runtime, config_dir, settings, created: None, error: None }
+        Self {
+            runtime,
+            config_dir,
+            settings,
+            created: None,
+            setup_gamepads: VideoSource::SCREEN_SUPPORTED && connect_host::gamepad_support().is_err(),
+            error: None,
+        }
     }
 
-    /// Returns the new account's endpoint once the user carries on into the app.
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<(Endpoint, Settings)> {
+    /// Once the user carries on into the app: the new account's endpoint, the settings, and
+    /// whether to set up gamepad support.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<(Endpoint, Settings, bool)> {
         let mut done = false;
         egui::CentralPanel::default().frame(theme::content()).show(ui, |ui| {
             ui.vertical_centered(|ui| {
@@ -38,7 +48,7 @@ impl Welcome {
         });
         if done {
             let endpoint = self.created.take().expect("shown above");
-            return Some((endpoint, std::mem::take(&mut self.settings)));
+            return Some((endpoint, std::mem::take(&mut self.settings), self.setup_gamepads));
         }
         None
     }
@@ -72,6 +82,21 @@ impl Welcome {
                 .weak(),
             );
         });
+        if VideoSource::SCREEN_SUPPORTED && connect_host::gamepad_support().is_err() {
+            ui.add_space(6.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.checkbox(&mut self.setup_gamepads, "Set up gamepad support");
+                ui.label(
+                    RichText::new(
+                        "Lets people who connect use their controller in your games. It's built in; \
+                         Windows asks for permission once.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        }
         ui.add_space(14.0);
 
         let named = !self.settings.device_name.trim().is_empty();

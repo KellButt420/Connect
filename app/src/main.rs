@@ -13,11 +13,19 @@
 //! image anywhere, and `--print-input` prints the remote input instead of acting on it; both are
 //! for development.
 //!
+//! On Windows the release build is a windowed app, so opening it shows no console. The terminal
+//! commands attach to the console they were started from; run them as
+//! `start /wait connect.exe …` so the terminal waits for them.
+//!
 //! Set `CONNECT_CONFIG_DIR` to use a separate identity, e.g. to run two copies on one PC, and
 //! `CONNECT_RENDERER=glow` if the window stays blank (falls back from wgpu to plain OpenGL).
 
+// No console window behind the app. Debug builds keep theirs, for the logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod cli;
 mod gui;
+mod update;
 
 use std::path::PathBuf;
 
@@ -34,11 +42,16 @@ usage: connect                        open the app
        connect id                     print this PC's User-ID";
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if !args.is_empty() {
+        attach_parent_console();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,iroh=warn,noq=warn".into()))
         .init();
+    update::clean_up_previous();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
         println!("{USAGE}");
         return Ok(());
@@ -62,6 +75,15 @@ fn main() -> Result<()> {
         }
         Some(other) => bail!("unknown command {other:?}\n\n{USAGE}"),
     }
+}
+
+/// Lets a terminal command print to the console it was started from; a windowed app has none of
+/// its own.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // Fails harmlessly when there is no parent console, e.g. output redirected to a file.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
 /// This PC's name as shown to the other side, until the user picks one.

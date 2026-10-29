@@ -21,7 +21,19 @@ Grab the latest build from [Releases](../../releases):
   Allow it through the firewall so direct connections work.
 - `connect-linux-x86_64`: Linux with glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13 or newer).
 
-To pass gamepads through, the **host** PC needs the free [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases).
+Connect updates itself: when a new release is out it shows **Update available**, and **Update now**
+downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
+checks on demand.
+
+Gamepads work on the host through the ViGEmBus driver, which is built into `connect.exe`. The
+welcome screen offers to set it up, and so does the Share page. Windows asks for permission once.
+The remote user's controller shows up as an Xbox 360 controller in the next free slot: player 2
+if the host has one plugged in, player 1 if not. The driver stays installed if Connect is deleted;
+remove it under Windows *Installed apps* ("ViGEm Bus Driver").
+
+The host's own mouse and keyboard always win: while the host is using one, the remote user's
+input on it pauses (and anything they held is released) until a second after the host stops.
+
 Windows won't let a normal program control one running as administrator, so to control such
 programs, run Connect as administrator on the host.
 
@@ -59,5 +71,11 @@ connect id                          print this PC's User-ID
 ```
 
 `--test-pattern` shares a generated image and `--print-input` prints the remote input instead of
-acting on it, both for development. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
+acting on it, both for development. On Windows the app has no console window, so start these as
+`start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
 copies on one PC.
+
+## Third-party components
+
+`connect.exe` includes the installer for [ViGEmBus](https://github.com/nefarius/ViGEmBus) 1.22.0
+(BSD-3-Clause, © Nefarius Software Solutions e.U.); see `crates/host/vendor/vigembus/`.

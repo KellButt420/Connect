@@ -10,7 +10,7 @@ use super::{App, theme};
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let timeout = connect_proto::APPROVAL_TIMEOUT;
-    let gamepad_problem = app.gamepad_support.as_ref().err().cloned();
+    let driver = &mut app.gamepad_driver;
     let Some(request) = app.requests.front_mut() else { return };
     let remaining = timeout.saturating_sub(request.arrived.elapsed()).as_secs();
 
@@ -35,10 +35,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         ui.add_space(8.0);
         ui.label(RichText::new("Let them use").strong());
         permission_toggles(ui, &mut request.permissions);
-        if request.permissions.allows(DeviceClass::Gamepad)
-            && let Some(problem) = &gamepad_problem
-        {
-            gamepad_warning(ui, problem);
+        if request.permissions.allows(DeviceClass::Gamepad) {
+            driver.setup_row(ui);
         }
         ui.label(RichText::new("You can change these at any time during the session.").weak().small());
 
@@ -66,16 +64,6 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         }
         request.inner.respond(decision);
     }
-}
-
-/// Why gamepads won't work on this PC, with a download link when the driver is missing.
-pub fn gamepad_warning(ui: &mut egui::Ui, problem: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(problem).color(theme::BAD).small());
-        if problem.contains("ViGEmBus") {
-            ui.hyperlink_to(RichText::new("Download ViGEmBus").small(), connect_host::GAMEPAD_DRIVER_URL);
-        }
-    });
 }
 
 /// A checkbox per input device, plus a "View only" shortcut. True if anything changed.

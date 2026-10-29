@@ -13,7 +13,13 @@ connect-proto.workspace = true
 eframe = { version = "0.37", features = ["persistence", "glow"] }
 gethostname = "1"
 gilrs = "0.11.2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sha2 = "0.11"
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Console"] }

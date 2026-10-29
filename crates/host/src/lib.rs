@@ -21,10 +21,10 @@ use std::{
 
 use connect_proto::{APPROVAL_TIMEOUT, CLOSE_NORMAL, Permissions};
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub use capture::VideoSource;
-pub use input::{GAMEPAD_DRIVER_URL, InputSink, gamepad_support};
+pub use input::{GAMEPAD_DRIVER_URL, InputSink, gamepad_support, install_gamepad_driver};
 
 /// Default cap on the video bitrate.
 pub const DEFAULT_BITRATE_MBPS: u32 = 20;
@@ -116,6 +116,8 @@ struct Shared {
     bitrate_mbps: AtomicU32,
     /// The one connection being asked about or served; anyone else is told the host is busy.
     slot: Mutex<Option<(EndpointId, Connection)>>,
+    /// Signalled when the slot empties, i.e. a session has fully ended and released its input.
+    idle: Notify,
     video: VideoSource,
     input: InputSink,
     approval_timeout: Duration,
@@ -131,6 +133,7 @@ pub fn start(endpoint: Endpoint, config: HostConfig) -> (HostHandle, mpsc::Recei
         trusted: RwLock::new(config.trusted),
         bitrate_mbps: AtomicU32::new(config.bitrate_mbps),
         slot: Mutex::new(None),
+        idle: Notify::new(),
         video: config.video,
         input: config.input,
         approval_timeout: config.approval_timeout,
@@ -201,6 +204,22 @@ impl HostHandle {
             conn.close(CLOSE_NORMAL.into(), b"The host ended the session.");
         }
     }
+
+    /// Stops accepting, ends any session, and waits until it has let go of everything the remote
+    /// user was holding (keys, buttons, gamepads). Call before the app exits.
+    pub async fn shutdown(&self) {
+        self.set_accepting(false);
+        loop {
+            let idle = self.0.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if lock(&self.0.slot).is_none() {
+                return;
+            }
+            self.disconnect();
+            idle.await;
+        }
+    }
 }
 
 impl Shared {
@@ -232,6 +251,7 @@ struct SlotGuard<'a>(&'a Shared);
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         *lock(&self.0.slot) = None;
+        self.0.idle.notify_waiters();
     }
 }
 

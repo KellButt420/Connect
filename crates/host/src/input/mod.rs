@@ -45,6 +45,15 @@ pub fn gamepad_support() -> Result<(), String> {
     Err("Gamepads need a Windows host.".into())
 }
 
+/// Sets up gamepad support with the driver built into the app. Windows asks the user for
+/// permission first. Blocks until the installer finishes, so call it off the UI thread.
+pub fn install_gamepad_driver() -> Result<(), String> {
+    #[cfg(windows)]
+    return windows::install_gamepad_driver();
+    #[cfg(not(windows))]
+    Err("Gamepads need a Windows host.".into())
+}
+
 /// Reads the client's input stream until the session ends.
 pub(crate) async fn serve(
     conn: Connection,
@@ -112,49 +121,66 @@ fn clamp(event: InputEvent) -> InputEvent {
 }
 
 /// Hands events to the sink. For [`InputSink::System`] that's a dedicated thread, so a slow
-/// driver call never holds up the network.
+/// driver call never holds up the network. Dropping it waits for that thread to apply what was
+/// sent and unplug its gamepads.
 struct Output {
-    tx: Option<mpsc::UnboundedSender<InputEvent>>,
+    send: Option<Box<dyn Fn(InputEvent) + Send>>,
     #[cfg(windows)]
-    _thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Output {
     fn open(sink: InputSink, unavailable: mpsc::UnboundedSender<Unavailable>) -> Self {
         match sink {
             InputSink::Channel(tx) => Output {
-                tx: Some(tx),
+                send: Some(Box::new(move |event| {
+                    let _ = tx.send(event);
+                })),
                 #[cfg(windows)]
-                _thread: None,
+                thread: None,
             },
             #[cfg(windows)]
             InputSink::System => {
-                let (tx, rx) = mpsc::unbounded_channel();
+                // A plain channel, so the thread can also wake on a timer to watch the host's input.
+                let (tx, rx) = std::sync::mpsc::channel();
                 let thread = std::thread::Builder::new()
                     .name("connect-input".into())
                     .spawn(move || windows::run(rx, unavailable))
                     .map_err(|e| tracing::warn!("couldn't start the input thread: {e}"))
                     .ok();
-                Output { tx: thread.as_ref().map(|_| tx), _thread: thread }
+                let send: Box<dyn Fn(InputEvent) + Send> = Box::new(move |event| {
+                    let _ = tx.send(event);
+                });
+                Output { send: thread.as_ref().map(|_| send), thread }
             }
             #[cfg(not(windows))]
             InputSink::System => {
                 drop(unavailable);
-                Output { tx: None }
+                Output { send: None }
             }
         }
     }
 
     fn send(&mut self, event: InputEvent) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(event);
+        if let Some(send) = &self.send {
+            send(event);
+        }
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.send = None; // ends the thread once it has applied everything queued
+        #[cfg(windows)]
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
 /// What the client is holding down right now, as far as the host has acted on it.
 #[derive(Default)]
-struct Held {
+pub(crate) struct Held {
     keys: HashSet<u16>,
     buttons: HashSet<MouseButton>,
     /// Gamepad slots not in their neutral state.
@@ -162,7 +188,7 @@ struct Held {
 }
 
 impl Held {
-    fn note(&mut self, event: &InputEvent) {
+    pub(crate) fn note(&mut self, event: &InputEvent) {
         match *event {
             InputEvent::Key { scancode, down } => toggle(&mut self.keys, scancode, down),
             InputEvent::MouseButton { button, down } => toggle(&mut self.buttons, button, down),
@@ -187,7 +213,7 @@ impl Held {
         DeviceClass::ALL.into_iter().flat_map(|d| self.release(d)).collect()
     }
 
-    fn release(&mut self, device: DeviceClass) -> Vec<InputEvent> {
+    pub(crate) fn release(&mut self, device: DeviceClass) -> Vec<InputEvent> {
         match device {
             DeviceClass::Keyboard => {
                 self.keys.drain().map(|scancode| InputEvent::Key { scancode, down: false }).collect()

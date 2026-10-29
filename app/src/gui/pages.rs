@@ -7,12 +7,7 @@ use connect_net as net;
 use connect_proto::DeviceClass;
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit};
 
-use super::{
-    App, ClientState, Page,
-    prompt::{gamepad_warning, permission_toggles},
-    settings::BITRATE_CHOICES_MBPS,
-    theme,
-};
+use super::{App, ClientState, Page, prompt::permission_toggles, settings::BITRATE_CHOICES_MBPS, theme};
 
 pub fn nav(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("Connect").size(22.0).strong().color(theme::ACCENT));
@@ -70,7 +65,6 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
 
-    let gamepad_problem = app.gamepad_support.as_ref().err().cloned();
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         if let Some(hosting) = &mut app.hosting {
@@ -88,10 +82,8 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
             if permission_toggles(ui, &mut hosting.permissions) {
                 app.host.set_permissions(hosting.permissions);
             }
-            if hosting.permissions.allows(DeviceClass::Gamepad)
-                && let Some(problem) = &gamepad_problem
-            {
-                gamepad_warning(ui, problem);
+            if hosting.permissions.allows(DeviceClass::Gamepad) {
+                app.gamepad_driver.setup_row(ui);
             }
             ui.separator();
         }
@@ -113,10 +105,8 @@ pub fn share(app: &mut App, ui: &mut egui::Ui) {
         if permission_toggles(ui, &mut app.settings.permissions) {
             app.host.set_default_permissions(app.settings.permissions);
         }
-        if app.settings.permissions.allows(DeviceClass::Gamepad)
-            && let Some(problem) = &gamepad_problem
-        {
-            gamepad_warning(ui, problem);
+        if app.settings.permissions.allows(DeviceClass::Gamepad) {
+            app.gamepad_driver.setup_row(ui);
         }
         ui.label(
             RichText::new(
@@ -272,6 +262,9 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
     }
 
+    app.updater.settings_card(ui);
+    ui.add_space(6.0);
+
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         theme::section_title(ui, "Account");
@@ -279,7 +272,6 @@ pub fn settings(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("Copy User-ID").clicked() {
             ui.ctx().copy_text(app.endpoint.id().to_string());
         }
-        ui.label(RichText::new(format!("Connect {}", env!("CARGO_PKG_VERSION"))).weak());
     });
 }
 

@@ -44,7 +44,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
         Err(_) => println!("no relay reachable yet; only direct connections will work for now."),
     }
 
-    let (_host, mut events) = connect_host::start(endpoint.clone(), HostConfig { video, input, ..HostConfig::new(device_name()) });
+    let (host, mut events) = connect_host::start(endpoint.clone(), HostConfig { video, input, ..HostConfig::new(device_name()) });
     let mut lines = stdin_lines();
 
     loop {
@@ -81,6 +81,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
             HostEvent::SessionEnded { reason, .. } => println!("Session ended: {reason}"),
         }
     }
+    host.shutdown().await;
     endpoint.close().await;
     Ok(())
 }

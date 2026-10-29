@@ -1,6 +1,7 @@
 //! The desktop app: first-run account setup, the Share / Connect / Settings pages, the
 //! Allow/Deny prompt, and the session view.
 
+mod driver;
 mod gamepad;
 mod input;
 mod pages;
@@ -8,13 +9,14 @@ mod prompt;
 mod session;
 mod settings;
 mod theme;
+mod updates;
 mod welcome;
 
 use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -37,9 +39,15 @@ use tokio::{
 use settings::Settings;
 use welcome::Welcome;
 
+/// How long closing may take to end sessions cleanly before the app exits regardless.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Set when an update has been installed: the executable to start once this one has exited.
+type Restart = Arc<Mutex<Option<PathBuf>>>;
+
 pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     // Lets the UI thread start tasks on the runtime.
-    let _guard = runtime.enter();
+    let guard = runtime.enter();
     // An existing account goes straight in; a new install first gets the welcome screen.
     let endpoint = match net::load_identity(&config_dir)? {
         Some(key) => Some(runtime.block_on(net::bind_endpoint(key))?),
@@ -60,12 +68,30 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         ..Default::default()
     };
     let handle = runtime.handle().clone();
-    eframe::run_native("Connect", options, Box::new(|cc| Ok(Box::new(Root::new(cc, handle, config_dir, endpoint)))))
-        .map_err(|e| anyhow::anyhow!("couldn't open the window: {e}"))
+    let restart = Restart::default();
+    let result = eframe::run_native(
+        "Connect",
+        options,
+        Box::new({
+            let restart = restart.clone();
+            |cc| Ok(Box::new(Root::new(cc, handle, config_dir, endpoint, restart)))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("couldn't open the window: {e}"));
+
+    // Sessions were ended in `on_exit`; don't let anything still running hold the process open.
+    drop(guard);
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    if let Some(exe) = restart.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        std::process::Command::new(&exe).spawn().map_err(|e| anyhow::anyhow!("couldn't restart Connect: {e}"))?;
+    }
+    result
 }
 
 /// The welcome screen until an account exists, then the app proper.
 struct Root {
+    runtime: Handle,
+    restart: Restart,
     screen: Screen,
 }
 
@@ -75,14 +101,20 @@ enum Screen {
 }
 
 impl Root {
-    fn new(cc: &eframe::CreationContext<'_>, runtime: Handle, config_dir: PathBuf, endpoint: Option<Endpoint>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        runtime: Handle,
+        config_dir: PathBuf,
+        endpoint: Option<Endpoint>,
+        restart: Restart,
+    ) -> Self {
         theme::apply(&cc.egui_ctx);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let screen = match endpoint {
-            Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings))),
-            None => Screen::Welcome(Welcome::new(runtime, config_dir, settings)),
+            Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings, restart.clone()))),
+            None => Screen::Welcome(Welcome::new(runtime.clone(), config_dir, settings)),
         };
-        Self { screen }
+        Self { runtime, restart, screen }
     }
 }
 
@@ -96,8 +128,12 @@ impl eframe::App for Root {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match &mut self.screen {
             Screen::Welcome(welcome) => {
-                if let Some((endpoint, settings)) = welcome.show(ui) {
-                    self.screen = Screen::Main(Box::new(App::new(ui.ctx(), endpoint, settings)));
+                if let Some((endpoint, settings, setup_gamepads)) = welcome.show(ui) {
+                    let mut app = App::new(ui.ctx(), endpoint, settings, self.restart.clone());
+                    if setup_gamepads {
+                        app.gamepad_driver.install(ui.ctx());
+                    }
+                    self.screen = Screen::Main(Box::new(app));
                 }
             }
             Screen::Main(app) => app.ui(ui),
@@ -110,6 +146,13 @@ impl eframe::App for Root {
             Screen::Main(app) => &app.settings,
         };
         eframe::set_value(storage, eframe::APP_KEY, settings);
+    }
+
+    /// The window is closing: end sessions so nothing is left held down or hanging.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Screen::Main(app) = &mut self.screen {
+            app.shutdown(&self.runtime);
+        }
     }
 }
 
@@ -126,8 +169,8 @@ pub struct App {
     settings: Settings,
     host: HostHandle,
     host_events: mpsc::UnboundedReceiver<HostEvent>,
-    /// Whether this PC can give a remote user a gamepad; `Err` says why not.
-    gamepad_support: Result<(), String>,
+    /// Whether this PC can give a remote user a gamepad, and setting that up.
+    gamepad_driver: driver::GamepadDriver,
     /// Connection requests waiting for Allow/Deny, oldest first.
     requests: VecDeque<Request>,
     /// Who is using this PC right now.
@@ -137,6 +180,8 @@ pub struct App {
     client: Option<ClientSession>,
     /// The latest thing worth telling the user, such as why a session ended.
     notice: Option<Notice>,
+    updater: updates::Updater,
+    restart: Restart,
 }
 
 struct Request {
@@ -187,7 +232,7 @@ enum ClientState {
 }
 
 impl App {
-    fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings) -> Self {
+    fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings, restart: Restart) -> Self {
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
             let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());
@@ -208,8 +253,6 @@ impl App {
                 ..HostConfig::new(settings.device_name.clone())
             },
         );
-        let gamepad_support =
-            if VideoSource::SCREEN_SUPPORTED { connect_host::gamepad_support() } else { Ok(()) };
 
         Self {
             endpoint,
@@ -217,7 +260,7 @@ impl App {
             settings,
             host,
             host_events: forward_host_events(events, ctx.clone()),
-            gamepad_support,
+            gamepad_driver: driver::GamepadDriver::new(),
             requests: VecDeque::new(),
             hosting: None,
             // Only Windows can host; elsewhere the host just turns callers away with the reason.
@@ -225,7 +268,22 @@ impl App {
             connect_input: String::new(),
             client: None,
             notice: None,
+            updater: updates::Updater::new(ctx),
+            restart,
         }
+    }
+
+    /// Hangs up as the app closes: the remote user's held input is released on this PC, and the
+    /// other side is told at once rather than waiting to time out.
+    fn shutdown(&mut self, runtime: &Handle) {
+        if let Some(client) = &self.client {
+            client.handle.disconnect();
+        }
+        let (host, endpoint) = (self.host.clone(), self.endpoint.clone());
+        runtime.block_on(async move {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, host.shutdown()).await;
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, endpoint.close()).await;
+        });
     }
 
     fn notify(&mut self, text: impl Into<String>, is_error: bool) {
@@ -328,6 +386,11 @@ impl App {
             self.notify("A connection request expired or was withdrawn.", false);
         }
         self.poll_client(ctx);
+        self.gamepad_driver.poll();
+        if let Some(exe) = self.updater.poll() {
+            *self.restart.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(exe);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
 
         // Countdown on the prompt, the elapsed timers, and notes fading out over the video.
         let waiting = self.client.as_ref().is_some_and(|c| !matches!(c.state, ClientState::Connected { .. }));
@@ -348,7 +411,9 @@ impl App {
             egui::Panel::left("nav").exact_size(210.0).resizable(false).frame(theme::sidebar()).show(ui, |ui| {
                 pages::nav(self, ui);
             });
+            let in_session = self.hosting.is_some() || self.client.is_some();
             egui::CentralPanel::default().frame(theme::content()).show(ui, |ui| {
+                self.updater.banner(ui, in_session);
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.page {
                     Page::Share => pages::share(self, ui),
                     Page::Connect => pages::connect(self, ui),

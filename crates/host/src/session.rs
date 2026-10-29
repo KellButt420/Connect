@@ -29,6 +29,8 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for a turned-away client to read the reason and hang up itself.
 const REJECT_LINGER: Duration = Duration::from_secs(3);
+/// How long a finished session may take to release the remote user's input.
+const INPUT_RELEASE: Duration = Duration::from_secs(2);
 
 const DECLINED: &str = "The host declined the connection.";
 const NO_ANSWER: &str = "The host didn't answer in time.";
@@ -108,7 +110,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         .await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
-    tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
+    let input =
+        tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
 
     let result = stream(conn, send, recv, video, permissions, unavailable).await;
     let reason = end_reason(conn, &client_name, &result);
@@ -116,6 +119,11 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if conn.close_reason().is_none() {
         let code = if result.is_ok() { CLOSE_NORMAL } else { CLOSE_PROTOCOL };
         conn.close(code.into(), b"session ended");
+    }
+    // The input task sees the close and releases whatever was held; the session isn't over
+    // (and the host can't shut down) until it has.
+    if timeout(INPUT_RELEASE, input).await.is_err() {
+        warn!("input took too long to release");
     }
     let _ = events.send(HostEvent::SessionEnded { peer, reason }).await;
     Ok(())

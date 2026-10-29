@@ -232,6 +232,26 @@ async fn input_obeys_permissions_and_is_released() {
     assert!(!matches!(extra, Ok(Some(_))), "unexpected input: {extra:?}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_releases_input_before_returning() {
+    let (sink, mut injected) = mpsc::unbounded_channel();
+    let (host_ep, host, mut host_events) =
+        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
+    accepted(&mut client_events).await;
+
+    let space = InputEvent::Key { scancode: 0x39, down: true };
+    client.send_input(space);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), space);
+
+    timeout(WAIT, host.shutdown()).await.expect("shutdown finishes");
+    assert_eq!(injected.try_recv().ok(), Some(InputEvent::Key { scancode: 0x39, down: false }), "released by then");
+    assert_eq!(ended(&mut client_events).await, EndReason::HostEnded("The host ended the session.".into()));
+    assert!(!host.accepting());
+    timeout(WAIT, host.shutdown()).await.expect("a second shutdown returns at once");
+}
+
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn only_windows_can_host() {
