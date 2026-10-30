@@ -1,7 +1,6 @@
 # Connect
 
-Performance fork of [volsatl9/Connect](https://github.com/volsatl9/Connect), with desktop audio,
-automatic GPU encoding, two-way cursor visibility, and compact session controls.
+Desktop audio, automatic GPU encoding, two-way cursor visibility, and compact session controls.
 Version 0.3 uses protocol 3: **update both PCs**. Older peers receive a version mismatch message.
 See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
 
@@ -25,8 +24,9 @@ Grab the latest build from [Releases](../../releases):
 
 - `connect.exe`: Windows 10 / 11. It's unsigned, so SmartScreen asks first: **More info → Run anyway**.
   Allow it through the firewall so direct connections work.
-- This fork currently publishes a Windows build. Linux can be built from source; the upstream
-  project also publishes Linux builds.
+- `connect-linux-x86_64`: Linux with glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13 or newer).
+
+The v0.3 media changes have been verified on Windows; Linux playback is not yet verified.
 
 Connect updates itself: when a new release is out it shows **Update available**, and **Update now**
 downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
