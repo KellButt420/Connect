@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use connect_net as net;
 use connect_proto::{
-    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, PROTOCOL_VERSION, Permissions,
+    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, CursorPosition, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
     video::{self, EncodedFrame},
 };
@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
+    audio::AudioStream,
+    cursor::CursorStream,
     encode::{VideoEvent, VideoStream},
     input::{self, Unavailable},
 };
@@ -105,15 +107,14 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     let welcome = HostMsg::Welcome { host_name: shared.host_name(), width, height, permissions: granted };
     net::write_msg(&mut send, &welcome).await?;
     info!(peer = %peer.fmt_short(), %client_name, width, height, ?granted, "session started");
-    let _ = events
-        .send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted })
-        .await;
+    let _ =
+        events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted }).await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
     let input =
         tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
 
-    let result = stream(conn, send, recv, video, permissions, unavailable).await;
+    let result = stream(conn, send, recv, video, permissions, unavailable, shared.video == VideoSource::Screen).await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -169,10 +170,30 @@ async fn stream(
     mut video: VideoStream,
     mut permissions: watch::Receiver<Permissions>,
     mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
+    desktop: bool,
 ) -> Result<()> {
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (msg_tx, mut msgs) = mpsc::channel(16);
     tokio::spawn(read_loop(recv, msg_tx));
+    let cursor = if desktop {
+        match CursorStream::start() {
+            Ok(cursor) => Some(cursor),
+            Err(error) => {
+                warn!("cursor sharing unavailable: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cursor_updates = cursor.as_ref().map(CursorStream::subscribe);
+    let mut cursor_tick = tokio::time::interval(Duration::from_millis(8));
+    cursor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shape_id = None;
+    let mut cursor_seq = 0u32;
+    let mut remote_seq = None;
+    let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
+    let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
 
     loop {
         tokio::select! {
@@ -191,13 +212,68 @@ async fn stream(
             },
             Ok(()) = permissions.changed() => {
                 let p = *permissions.borrow_and_update();
+                // Drop the capture callback before acknowledging a revoked permission.
+                let enabled = desktop && p.allows(DeviceClass::Audio);
+                if enabled != audio_enabled { audio = None; }
                 net::write_msg(&mut send, &HostMsg::PermissionsChanged(p)).await?;
+                if enabled != audio_enabled {
+                    audio_enabled = enabled;
+                    audio = start_audio(conn, &mut send, enabled).await?;
+                }
+            }
+            packet = async {
+                match &mut audio { Some(audio) => audio.next().await, None => std::future::pending().await }
+            } => {
+                if !permissions.borrow().allows(DeviceClass::Audio) { audio = None; continue; }
+                match packet {
+                    Some(Ok(data)) => {
+                        match conn.send_datagram(data) {
+                            Ok(()) => {},
+                            Err(SendDatagramError::TooLarge) => {
+                                // A smaller path MTU requires a fresh packetizer, not endless PCM loss.
+                                drop(audio.take());
+                                let enabled = permissions.borrow().allows(DeviceClass::Audio);
+                                audio = start_audio(conn, &mut send, enabled).await?;
+                            },
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    error => {
+                        let reason = match error { Some(Err(error)) => format!("Desktop audio stopped: {error:#}"), _ => "Desktop audio stopped.".into() };
+                        audio = None;
+                        net::write_msg(&mut send, &HostMsg::AudioStatus { active: false, reason: Some(reason) }).await?;
+                    }
+                }
+            }
+            _ = cursor_tick.tick(), if cursor_updates.is_some() => {
+                let state = cursor_updates.as_ref().expect("guarded").borrow().clone();
+                if let Some(shape) = state.shape && shape_id != Some(shape.id) {
+                        net::write_msg(&mut send, &HostMsg::CursorShape((*shape).clone())).await?;
+                        shape_id = Some(shape.id);
+                }
+                let mut position = state.position;
+                position.seq = cursor_seq;
+                cursor_seq = cursor_seq.wrapping_add(1);
+                match conn.send_datagram(position.encode()) {
+                    Ok(()) | Err(SendDatagramError::TooLarge) => {},
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            datagram = conn.read_datagram() => {
+                let Ok(datagram) = datagram else { return Ok(()); };
+                if let Ok(position) = CursorPosition::decode(&datagram) && remote_seq.is_none_or(|seq| position.is_newer_than(seq)) {
+                        remote_seq = Some(position.seq);
+                        if let Some(cursor) = &cursor { cursor.set_remote_pointer(position); }
+                }
             }
             Some(Unavailable { device, reason }) = unavailable.recv() => {
                 net::write_msg(&mut send, &HostMsg::InputUnavailable { device, reason }).await?;
             }
             event = video.next() => match event {
                 Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame)?,
+                Some(Ok(VideoEvent::Encoder { name })) => {
+                    net::write_msg(&mut send, &HostMsg::VideoEncoder { name }).await?;
+                }
                 Some(Ok(VideoEvent::Format { width, height })) => {
                     net::write_msg(&mut send, &HostMsg::VideoFormat { width, height }).await?;
                 }
@@ -205,6 +281,30 @@ async fn stream(
                 None => bail!("video thread stopped"),
             },
             _ = conn.closed() => return Ok(()),
+        }
+    }
+}
+
+async fn start_audio(conn: &Connection, send: &mut SendStream, enabled: bool) -> Result<Option<AudioStream>> {
+    if !enabled {
+        net::write_msg(send, &HostMsg::AudioStatus { active: false, reason: None }).await?;
+        return Ok(None);
+    }
+    let max = conn.max_datagram_size().context("peer does not accept audio datagrams")?;
+    match tokio::task::spawn_blocking(move || AudioStream::start(max)).await {
+        Ok(Ok(audio)) => {
+            net::write_msg(send, &HostMsg::AudioStatus { active: true, reason: None }).await?;
+            Ok(Some(audio))
+        }
+        result => {
+            let reason = match result {
+                Ok(Err(error)) => format!("Desktop audio unavailable: {error:#}"),
+                Err(error) => format!("Desktop audio capture stopped: {error}"),
+                _ => unreachable!(),
+            };
+            warn!(%reason);
+            net::write_msg(send, &HostMsg::AudioStatus { active: false, reason: Some(reason) }).await?;
+            Ok(None)
         }
     }
 }

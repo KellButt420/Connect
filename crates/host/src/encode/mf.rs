@@ -1,0 +1,787 @@
+//! Direct hardware-only Media Foundation H.264 encoding.
+//!
+//! The object, COM apartment and MF startup all belong to the capture thread. CPU I420 to
+//! NV12 packing is intentional; the selected encoder itself must be a hardware MFT.
+
+use std::{
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use openh264::formats::YUVSource;
+use windows::{
+    Win32::{
+        Foundation::{E_NOTIMPL, S_FALSE, S_OK},
+        Media::MediaFoundation::*,
+        System::{
+            Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
+            Variant::VARIANT,
+        },
+    },
+    core::{GUID, Interface},
+};
+
+const MAX_BITSTREAM: usize = 16 * 1024 * 1024;
+const MAX_RAW_BYTES: usize = 128 * 1024 * 1024;
+const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+const START_TIMEOUT: Duration = Duration::from_secs(2);
+const GOP_FRAMES: u64 = 600;
+
+pub(crate) struct HardwareFrame {
+    pub data: Vec<u8>,
+    pub keyframe: bool,
+    pub capture_time_us: u64,
+}
+
+pub(crate) struct HardwareEncoder {
+    transform: IMFTransform,
+    codec: ICodecAPI,
+    events: Option<IMFMediaEventGenerator>,
+    _activation: Activation,
+    name: String,
+    width: usize,
+    height: usize,
+    fps: u32,
+    input_id: u32,
+    output_id: u32,
+    input_credit: u32,
+    output_credit: u32,
+    frames: u64,
+    last_timestamp: Option<i64>,
+    bitstream: H264Bitstream,
+    // Declared last: all COM interfaces are released before MF/COM shutdown.
+    _runtime: Runtime,
+}
+
+struct Runtime(PhantomData<Rc<()>>);
+
+impl Runtime {
+    fn new() -> Result<Self> {
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().context("initializing video COM apartment")?;
+            if let Err(error) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
+                CoUninitialize();
+                return Err(error).context("starting Media Foundation");
+            }
+        }
+        Ok(Self(PhantomData))
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = MFShutdown();
+            CoUninitialize();
+        }
+    }
+}
+
+struct Activation(IMFActivate);
+
+impl Drop for Activation {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.0.ShutdownObject();
+        }
+    }
+}
+
+impl HardwareEncoder {
+    pub fn new(width: u32, height: u32, bitrate_bps: u32, fps: u32) -> Result<Self> {
+        ensure!(
+            width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+            "hardware H.264 requires nonempty even dimensions"
+        );
+        ensure!(fps > 0 && fps <= 240 && bitrate_bps > 0, "invalid H.264 frame rate or bitrate");
+        let bytes = u64::from(width) * u64::from(height) * 3 / 2;
+        ensure!(bytes <= MAX_RAW_BYTES as u64, "hardware H.264 image exceeds input limit");
+        let runtime = Runtime::new()?;
+        let activations = hardware_encoders()?;
+        let mut failures = Vec::new();
+        for activation in activations {
+            let name = attribute_string(&activation.0, &MFT_FRIENDLY_NAME_Attribute)
+                .unwrap_or_else(|_| "unnamed hardware H.264 MFT".into());
+            match Self::configure(&activation, width, height, bitrate_bps, fps) {
+                Ok((transform, codec, events, input_id, output_id)) => {
+                    return Ok(Self {
+                        transform,
+                        codec,
+                        events,
+                        _activation: activation,
+                        name: format!("GPU: {name}"),
+                        width: width as usize,
+                        height: height as usize,
+                        fps,
+                        input_id,
+                        output_id,
+                        input_credit: 0,
+                        output_credit: 0,
+                        frames: 0,
+                        last_timestamp: None,
+                        bitstream: H264Bitstream::default(),
+                        _runtime: runtime,
+                    });
+                }
+                Err(error) => failures.push(format!("{name}: {error:#}")),
+            }
+        }
+        bail!(
+            "no usable hardware H.264 encoder: {}",
+            if failures.is_empty() {
+                "MFTEnumEx returned no hardware NV12/H.264 transforms".into()
+            } else {
+                failures.join("; ")
+            }
+        )
+    }
+
+    fn configure(
+        activation: &Activation,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+    ) -> Result<(IMFTransform, ICodecAPI, Option<IMFMediaEventGenerator>, u32, u32)> {
+        unsafe {
+            // Both the enumeration flag and hardware registration are required. Never instantiate
+            // the Microsoft software encoder as an alternative within this module.
+            ensure!(
+                !attribute_string(&activation.0, &MFT_ENUM_HARDWARE_URL_Attribute)?.is_empty(),
+                "MFT has no hardware registration"
+            );
+            let transform: IMFTransform = activation.0.ActivateObject().context("activating hardware MFT")?;
+            let attributes = transform.GetAttributes()?;
+            let asynchronous = attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0;
+            let events = if asynchronous {
+                attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+                Some(transform.cast::<IMFMediaEventGenerator>()?)
+            } else {
+                None
+            };
+            let codec: ICodecAPI = transform.cast().context("hardware MFT has no codec controls")?;
+            set_value(&codec, &CODECAPI_AVLowLatencyMode, &VARIANT::from(true))
+                .context("hardware encoder does not accept low-latency mode")?;
+            ensure!(
+                bool::try_from(&codec.GetValue(&CODECAPI_AVLowLatencyMode)?)?,
+                "hardware encoder did not enable low latency"
+            );
+            // Baseline profile independently excludes B slices. If B-picture control is exposed,
+            // require the driver to accept and report zero instead of ignoring a failed setting.
+            if supports(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount)? {
+                set_u32(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
+                ensure!(
+                    u32::try_from(&codec.GetValue(&CODECAPI_AVEncMPVDefaultBPictureCount)?)? == 0,
+                    "hardware encoder enables B frames"
+                );
+            }
+            ensure!(
+                supports(&codec, &CODECAPI_AVEncVideoForceKeyFrame)?,
+                "hardware encoder cannot request recovery keyframes"
+            );
+            set_u32(&codec, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32)?;
+            set_u32(&codec, &CODECAPI_AVEncCommonMeanBitRate, bitrate)?;
+            // Explicit periodic force-IDR below also covers drivers without a GOP size control.
+            if supports(&codec, &CODECAPI_AVEncMPVGOPSize)? {
+                set_u32(&codec, &CODECAPI_AVEncMPVGOPSize, GOP_FRAMES as u32)?;
+            }
+            let (mut inputs, mut outputs) = (0, 0);
+            transform.GetStreamCount(&mut inputs, &mut outputs)?;
+            ensure!(inputs == 1 && outputs == 1, "unsupported hardware MFT stream count");
+            let (mut input_ids, mut output_ids) = ([0], [0]);
+            if let Err(error) = transform.GetStreamIDs(&mut input_ids, &mut output_ids) {
+                ensure!(error.code() == E_NOTIMPL, "querying hardware MFT stream IDs: {error}");
+            }
+            let (input_id, output_id) = (input_ids[0], output_ids[0]);
+            let output = video_type(width, height, fps, &MFVideoFormat_H264)?;
+            output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            output.SetUINT32(&MF_MT_VIDEO_NO_FRAME_ORDERING, 1)?;
+            transform.SetOutputType(output_id, &output, 0).context("setting hardware H.264 output type")?;
+            let input = video_type(width, height, fps, &MFVideoFormat_NV12)?;
+            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
+            input.SetUINT32(&MF_MT_SAMPLE_SIZE, width * height * 3 / 2)?;
+            input.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
+            transform.SetInputType(input_id, &input, 0).context("setting hardware NV12 input type")?;
+            // Verify the negotiated profile, as it is our guarantee when a driver omits B control.
+            let actual = transform.GetOutputCurrentType(output_id)?;
+            ensure!(
+                actual.GetUINT32(&MF_MT_MPEG2_PROFILE)? == eAVEncH264VProfile_Base.0 as u32,
+                "hardware encoder did not negotiate baseline H.264"
+            );
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+            Ok((transform, codec, events, input_id, output_id))
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn encode(
+        &mut self,
+        image: &impl YUVSource,
+        capture_time_us: u64,
+        force_keyframe: bool,
+    ) -> Result<Vec<HardwareFrame>> {
+        ensure!(image.dimensions() == (self.width, self.height), "recreate hardware encoder after resizing");
+        let timestamp = i64::try_from(capture_time_us.checked_mul(10).context("capture timestamp overflow")?)?;
+        ensure!(self.last_timestamp.is_none_or(|last| timestamp > last), "capture timestamps must increase");
+        let timeout = if self.frames == 0 { START_TIMEOUT } else { FRAME_TIMEOUT };
+        let deadline = Instant::now() + timeout;
+        while self.events.is_some() && self.input_credit == 0 {
+            self.poll_events()?;
+            ensure!(Instant::now() < deadline, "hardware encoder timed out requesting input");
+            if self.input_credit == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let keyframe_requested = force_keyframe || self.frames.is_multiple_of(GOP_FRAMES);
+        if keyframe_requested {
+            set_u32(&self.codec, &CODECAPI_AVEncVideoForceKeyFrame, 1).context("requesting hardware IDR frame")?;
+        }
+        let sample = self.input_sample(image, timestamp)?;
+        unsafe {
+            self.transform.ProcessInput(self.input_id, &sample, 0).context("submitting NV12 frame to hardware")?;
+        }
+        self.input_credit = self.input_credit.saturating_sub(1);
+        self.last_timestamp = Some(timestamp);
+        self.frames += 1;
+        // Exactly one in-flight frame. A driver that buffers/reorders despite the requested
+        // controls fails boundedly, so the owner can recreate or fall back to OpenH264.
+        loop {
+            if self.events.is_some() {
+                self.poll_events()?;
+            }
+            if (self.events.is_none() || self.output_credit > 0)
+                && let Some(sample) = self.output_sample()?
+            {
+                let output_time =
+                    unsafe { sample.GetSampleTime() }.context("hardware output has no capture timestamp")?;
+                ensure!(output_time == timestamp, "hardware encoder reordered or changed sample timestamps");
+                self.read_sequence_header()?;
+                let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
+                let data = read_buffer(&buffer)?;
+                let (data, keyframe) = self.bitstream.frame(&data)?;
+                ensure!(!keyframe_requested || keyframe, "hardware encoder did not honor recovery IDR request");
+                return Ok(vec![HardwareFrame { data, keyframe, capture_time_us: (output_time / 10) as u64 }]);
+            }
+            ensure!(Instant::now() < deadline, "hardware encoder timed out producing a frame (one frame in flight)");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn poll_events(&mut self) -> Result<()> {
+        let Some(events) = &self.events else {
+            return Ok(());
+        };
+        // Bound a driver flooding events as well as the wait for a missing event.
+        for _ in 0..64 {
+            let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => event,
+                Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
+                Err(error) => return Err(error).context("polling hardware encoder events"),
+            };
+            unsafe {
+                event.GetStatus()?.ok().context("hardware encoder asynchronous failure")?;
+                match event.GetType()? {
+                    value if value == METransformNeedInput.0 as u32 => {
+                        let stream = event.GetUINT32(&MF_EVENT_MFT_INPUT_STREAM_ID)?;
+                        ensure!(stream == self.input_id, "hardware encoder requested an unknown stream");
+                        self.input_credit = self
+                            .input_credit
+                            .checked_add(1)
+                            .filter(|v| *v <= 64)
+                            .context("hardware encoder excessive input requests")?;
+                    }
+                    value if value == METransformHaveOutput.0 as u32 => {
+                        self.output_credit = self
+                            .output_credit
+                            .checked_add(1)
+                            .filter(|v| *v <= 64)
+                            .context("hardware encoder excessive output events")?;
+                    }
+                    value if value == MEError.0 as u32 => {
+                        bail!("hardware encoder reported MEError")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        bail!("hardware encoder flooded its event queue")
+    }
+
+    fn input_sample(&self, image: &impl YUVSource, timestamp: i64) -> Result<IMFSample> {
+        let nv12 = pack_nv12(image)?;
+        unsafe {
+            let buffer = MFCreateMemoryBuffer(nv12.len() as u32)?;
+            let mut pointer = std::ptr::null_mut();
+            buffer.Lock(&mut pointer, None, None)?;
+            std::ptr::copy_nonoverlapping(nv12.as_ptr(), pointer, nv12.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(nv12.len() as u32)?;
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(timestamp)?;
+            sample.SetSampleDuration(10_000_000 / i64::from(self.fps))?;
+            Ok(sample)
+        }
+    }
+
+    fn output_sample(&mut self) -> Result<Option<IMFSample>> {
+        // A stream change can accompany the first output. Renegotiate at most four times.
+        for _ in 0..4 {
+            unsafe {
+                let info = self.transform.GetOutputStreamInfo(self.output_id)?;
+                let sample = if info.dwFlags
+                    & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32
+                    != 0
+                {
+                    None
+                } else {
+                    ensure!(
+                        info.cbSize > 0 && info.cbSize as usize <= MAX_BITSTREAM,
+                        "invalid hardware output buffer size"
+                    );
+                    let sample = MFCreateSample()?;
+                    // cbAlignment is an alignment mask (0 means no alignment requirement).
+                    sample.AddBuffer(&MFCreateAlignedMemoryBuffer(info.cbSize, info.cbAlignment)?)?;
+                    Some(sample)
+                };
+                let mut output = [MFT_OUTPUT_DATA_BUFFER {
+                    dwStreamID: self.output_id,
+                    pSample: ManuallyDrop::new(sample),
+                    ..Default::default()
+                }];
+                let mut status = 0;
+                let result = self.transform.ProcessOutput(0, &mut output, &mut status);
+                let sample = ManuallyDrop::take(&mut output[0].pSample);
+                drop(ManuallyDrop::take(&mut output[0].pEvents));
+                match result {
+                    Ok(()) => {
+                        self.output_credit = self.output_credit.saturating_sub(1);
+                        ensure!(sample.is_some(), "hardware encoder returned no output sample");
+                        return Ok(sample);
+                    }
+                    Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                        self.output_credit = self.output_credit.saturating_sub(1);
+                        return Ok(None);
+                    }
+                    Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        let media_type = self.transform.GetOutputAvailableType(self.output_id, 0)?;
+                        ensure!(
+                            media_type.GetGUID(&MF_MT_SUBTYPE)? == MFVideoFormat_H264,
+                            "hardware encoder changed output codec"
+                        );
+                        ensure!(
+                            media_type.GetUINT64(&MF_MT_FRAME_SIZE)?
+                                == pack_pair(self.width as u32, self.height as u32),
+                            "hardware encoder changed output size"
+                        );
+                        self.transform.SetOutputType(self.output_id, &media_type, 0)?;
+                    }
+                    Err(error) => return Err(error).context("receiving hardware H.264 output"),
+                }
+            }
+        }
+        bail!("hardware encoder repeatedly changed its output format")
+    }
+
+    fn read_sequence_header(&mut self) -> Result<()> {
+        unsafe {
+            let media_type = self.transform.GetOutputCurrentType(self.output_id)?;
+            if let Ok(size) = media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) {
+                ensure!(size <= 1024 * 1024, "oversized hardware H.264 sequence header");
+                if size > 0 {
+                    let mut header = vec![0; size as usize];
+                    media_type.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut header, None)?;
+                    self.bitstream.sequence_header(&header)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HardwareEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            // Flush discards outstanding work; do not drain/wait during disconnect or resizing.
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+    }
+}
+
+fn hardware_encoders() -> Result<Vec<Activation>> {
+    unsafe {
+        let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
+        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+        let (mut pointer, mut count) = (std::ptr::null_mut(), 0);
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(&input),
+            Some(&output),
+            &mut pointer,
+            &mut count,
+        )
+        .context("enumerating hardware H.264 transforms")?;
+        if pointer.is_null() {
+            return Ok(Vec::new());
+        }
+        let list = std::slice::from_raw_parts_mut(pointer, count as usize);
+        let result = list.iter_mut().filter_map(Option::take).map(Activation).collect();
+        CoTaskMemFree(Some(pointer.cast()));
+        Ok(result)
+    }
+}
+
+fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Result<String> {
+    unsafe {
+        let size = attributes.GetStringLength(key)?;
+        ensure!(size <= 16384, "oversized MFT registration string");
+        let mut value = vec![0; size as usize + 1];
+        attributes.GetString(key, &mut value, None)?;
+        Ok(String::from_utf16_lossy(&value[..size as usize]))
+    }
+}
+
+fn set_u32(codec: &ICodecAPI, key: &GUID, value: u32) -> Result<()> {
+    set_value(codec, key, &VARIANT::from(value))
+        .with_context(|| format!("setting hardware codec property {key:?} to {value}"))
+}
+
+fn supports(codec: &ICodecAPI, key: &GUID) -> Result<bool> {
+    // The generated Result<()> wrapper accepts S_FALSE, which here means unsupported.
+    unsafe {
+        let status = (codec.vtable().IsSupported)(codec.as_raw(), key);
+        if status == S_FALSE || status == E_NOTIMPL {
+            return Ok(false);
+        }
+        ensure!(status == S_OK, "querying hardware codec property {key:?}: {status}");
+        Ok(true)
+    }
+}
+
+fn set_value(codec: &ICodecAPI, key: &GUID, value: &VARIANT) -> Result<()> {
+    // SetValue also uses S_FALSE to report a read-only setting. Preserve that distinction.
+    unsafe {
+        let status = (codec.vtable().SetValue)(codec.as_raw(), key, value);
+        ensure!(status == S_OK, "hardware codec did not accept property {key:?}: {status}");
+        Ok(())
+    }
+}
+
+fn pack_pair(first: u32, second: u32) -> u64 {
+    (u64::from(first) << 32) | u64::from(second)
+}
+
+fn video_type(width: u32, height: u32, fps: u32, subtype: &GUID) -> Result<IMFMediaType> {
+    unsafe {
+        let media_type = MFCreateMediaType()?;
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_pair(width, height))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pack_pair(fps, 1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_pair(1, 1))?;
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        Ok(media_type)
+    }
+}
+
+fn read_buffer(buffer: &IMFMediaBuffer) -> Result<Vec<u8>> {
+    unsafe {
+        let (mut pointer, mut length) = (std::ptr::null_mut(), 0);
+        buffer.Lock(&mut pointer, None, Some(&mut length))?;
+        let data = if length as usize <= MAX_BITSTREAM && !pointer.is_null() {
+            Ok(std::slice::from_raw_parts(pointer, length as usize).to_vec())
+        } else {
+            Err(anyhow::anyhow!("invalid hardware bitstream buffer length {length}"))
+        };
+        buffer.Unlock()?;
+        data
+    }
+}
+
+fn pack_nv12(image: &impl YUVSource) -> Result<Vec<u8>> {
+    let (width, height) = image.dimensions();
+    ensure!(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0, "invalid NV12 dimensions");
+    let size = width.checked_mul(height).and_then(|n| n.checked_add(n / 2)).context("NV12 size overflow")?;
+    ensure!(size <= MAX_RAW_BYTES, "NV12 image exceeds input limit");
+    let (ys, us, vs) = image.strides();
+    let (y, u, v) = (image.y(), image.u(), image.v());
+    for (plane, stride, rows, columns) in
+        [(y, ys, height, width), (u, us, height / 2, width / 2), (v, vs, height / 2, width / 2)]
+    {
+        let required =
+            stride.checked_mul(rows - 1).and_then(|n| n.checked_add(columns)).context("YUV plane size overflow")?;
+        ensure!(stride >= columns && plane.len() >= required, "truncated YUV input plane");
+    }
+    let mut result = Vec::with_capacity(size);
+    for row in 0..height {
+        result.extend_from_slice(&y[row * ys..row * ys + width]);
+    }
+    for row in 0..height / 2 {
+        for column in 0..width / 2 {
+            result.extend_from_slice(&[u[row * us + column], v[row * vs + column]]);
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Default)]
+struct H264Bitstream {
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    length_size: Option<usize>,
+}
+
+impl H264Bitstream {
+    fn sequence_header(&mut self, data: &[u8]) -> Result<()> {
+        if data.first() != Some(&1) {
+            let units = nal_units(data, self.length_size)?;
+            self.remember(&units);
+            return Ok(());
+        }
+        // AVCDecoderConfigurationRecord: parameter sets use 16-bit lengths regardless of the
+        // separately encoded sample length size. Do not confuse it with an Annex-B header.
+        ensure!(data.len() >= 7, "truncated AVC configuration");
+        let length_size = usize::from(data[4] & 3) + 1;
+        ensure!(length_size != 3, "reserved AVC NAL length size");
+        let mut offset = 6;
+        let mut units = Vec::new();
+        for _ in 0..data[5] & 31 {
+            units.push(take_nal(data, &mut offset, 2)?);
+        }
+        let count = *data.get(offset).context("missing AVC PPS count")?;
+        offset += 1;
+        for _ in 0..count {
+            units.push(take_nal(data, &mut offset, 2)?);
+        }
+        self.remember(&units);
+        self.length_size = Some(length_size);
+        Ok(())
+    }
+
+    fn remember(&mut self, units: &[&[u8]]) {
+        for unit in units {
+            match unit.first().map(|b| b & 31) {
+                Some(7) => self.sps = unit.to_vec(),
+                Some(8) => self.pps = unit.to_vec(),
+                _ => {}
+            }
+        }
+    }
+
+    fn frame(&mut self, data: &[u8]) -> Result<(Vec<u8>, bool)> {
+        ensure!(!data.is_empty() && data.len() <= MAX_BITSTREAM, "empty or oversized H.264 frame");
+        let units = nal_units(data, self.length_size)?;
+        self.remember(&units);
+        ensure!(
+            self.sps.get(1).is_none_or(|profile| *profile == 66),
+            "hardware bitstream is not baseline H.264 (cannot guarantee no B frames)"
+        );
+        let keyframe = units.iter().any(|unit| unit[0] & 31 == 5);
+        ensure!(units.iter().any(|unit| matches!(unit[0] & 31, 1 | 5)), "hardware output contains no video slice");
+        let mut result = Vec::with_capacity(data.len() + self.sps.len() + self.pps.len() + 16);
+        if keyframe {
+            ensure!(!self.sps.is_empty() && !self.pps.is_empty(), "hardware IDR has no SPS/PPS for decoder recovery");
+            // An access-unit delimiter, when present, precedes the parameter sets.
+            for unit in units.iter().filter(|unit| unit[0] & 31 == 9) {
+                result.extend_from_slice(&[0, 0, 0, 1]);
+                result.extend_from_slice(unit);
+            }
+            for unit in [&self.sps, &self.pps] {
+                result.extend_from_slice(&[0, 0, 0, 1]);
+                result.extend_from_slice(unit);
+            }
+        }
+        for unit in units {
+            // Cached parameter sets are placed together before every IDR, exactly once.
+            if keyframe && matches!(unit[0] & 31, 7..=9) {
+                continue;
+            }
+            result.extend_from_slice(&[0, 0, 0, 1]);
+            result.extend_from_slice(unit);
+        }
+        ensure!(result.len() <= MAX_BITSTREAM, "H.264 frame with parameter sets exceeds limit");
+        Ok((result, keyframe))
+    }
+}
+
+fn take_nal<'a>(data: &'a [u8], offset: &mut usize, length_size: usize) -> Result<&'a [u8]> {
+    let length = data
+        .get(*offset..*offset + length_size)
+        .context("truncated H.264 NAL length")?
+        .iter()
+        .fold(0usize, |value, byte| (value << 8) | usize::from(*byte));
+    *offset += length_size;
+    ensure!(length > 0 && length <= MAX_BITSTREAM, "invalid H.264 NAL length");
+    let end = offset.checked_add(length).context("H.264 NAL length overflow")?;
+    let unit = data.get(*offset..end).context("truncated H.264 NAL payload")?;
+    *offset = end;
+    validate_nal(unit)?;
+    Ok(unit)
+}
+
+fn validate_nal(unit: &[u8]) -> Result<()> {
+    ensure!(!unit.is_empty() && unit[0] & 128 == 0 && (1..=23).contains(&(unit[0] & 31)), "invalid H.264 NAL header");
+    Ok(())
+}
+
+fn nal_units(data: &[u8], length_size: Option<usize>) -> Result<Vec<&[u8]>> {
+    // An AVCC length such as 0x00000100 resembles a start code. Prefer fully
+    // validated AVCC when the sequence header advertised its length size.
+    if let Some(length_size) = length_size {
+        let parse = || -> Result<Vec<&[u8]>> {
+            let mut offset = 0;
+            let mut units = Vec::new();
+            while offset < data.len() {
+                units.push(take_nal(data, &mut offset, length_size)?);
+            }
+            ensure!(!units.is_empty(), "empty AVCC access unit");
+            Ok(units)
+        };
+        if let Ok(units) = parse() {
+            return Ok(units);
+        }
+    }
+    let start_code = |offset: usize| {
+        if data.get(offset..offset + 4) == Some(&[0, 0, 0, 1]) {
+            4
+        } else if data.get(offset..offset + 3) == Some(&[0, 0, 1]) {
+            3
+        } else {
+            0
+        }
+    };
+    let mut units = Vec::new();
+    if start_code(0) > 0 {
+        let mut offset = 0;
+        while offset < data.len() {
+            let begin = offset + start_code(offset);
+            let mut end = begin;
+            while end < data.len() && start_code(end) == 0 {
+                end += 1;
+            }
+            let mut payload_end = end;
+            while payload_end > begin && data[payload_end - 1] == 0 {
+                payload_end -= 1;
+            }
+            let unit = &data[begin..payload_end];
+            validate_nal(unit)?;
+            units.push(unit);
+            offset = end;
+        }
+    } else {
+        let mut offset = 0;
+        while offset < data.len() {
+            units.push(take_nal(data, &mut offset, length_size.unwrap_or(4))?);
+        }
+    }
+    ensure!(!units.is_empty(), "empty H.264 access unit");
+    Ok(units)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openh264::{
+        decoder::Decoder,
+        formats::{BgraSliceU8, YUVBuffer},
+    };
+
+    #[test]
+    fn bitstream_annex_b_and_avcc_recover_parameter_sets() {
+        let mut stream = H264Bitstream::default();
+        stream.sequence_header(&[1, 66, 0, 31, 0xff, 0xe1, 0, 3, 0x67, 66, 31, 1, 0, 2, 0x68, 42]).unwrap();
+        let (frame, keyframe) = stream.frame(&[0, 0, 0, 2, 0x65, 42]).unwrap();
+        assert!(keyframe);
+        assert_eq!(frame, [0, 0, 0, 1, 0x67, 66, 31, 0, 0, 0, 1, 0x68, 42, 0, 0, 0, 1, 0x65, 42]);
+        let (frame, keyframe) = stream.frame(&[0, 0, 1, 0x41, 42]).unwrap();
+        assert!(!keyframe);
+        assert_eq!(frame, [0, 0, 0, 1, 0x41, 42]);
+        let (frame, keyframe) = stream.frame(&[0, 0, 0, 1, 0x65, 43]).unwrap();
+        assert!(keyframe);
+        assert_eq!(nal_units(&frame, None).unwrap().iter().map(|n| n[0] & 31).collect::<Vec<_>>(), [7, 8, 5]);
+    }
+
+    #[test]
+    fn bitstream_rejects_truncation_and_idr_without_parameter_sets() {
+        for bytes in [&[][..], &[0, 0, 0, 0], &[0, 0, 0, 8, 0x41], &[0, 0, 1], &[0, 0, 1, 0xe5], &[0, 0, 1, 0x65, 42]] {
+            assert!(H264Bitstream::default().frame(bytes).is_err(), "accepted {bytes:?}");
+        }
+        for bytes in [&[1][..], &[1, 66, 0, 31, 0xff, 0xe1, 0, 50], &[1, 66, 0, 31, 0xfe, 0xe0, 0]] {
+            assert!(H264Bitstream::default().sequence_header(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn bitstream_preserves_aud_order_and_ambiguous_avcc_lengths() {
+        let mut stream = H264Bitstream::default();
+        let (frame, keyframe) = stream
+            .frame(&[0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 66, 31, 0, 0, 1, 0x68, 42, 0, 0, 1, 0x65, 42])
+            .unwrap();
+        assert!(keyframe);
+        assert_eq!(nal_units(&frame, None).unwrap().iter().map(|n| n[0] & 31).collect::<Vec<_>>(), [9, 7, 8, 5]);
+        for length_size in [1, 2, 4] {
+            let unit = [0x41, 42];
+            let mut avcc = vec![0; length_size];
+            avcc[length_size - 1] = unit.len() as u8;
+            avcc.extend_from_slice(&unit);
+            assert_eq!(nal_units(&avcc, Some(length_size)).unwrap(), [&unit[..]]);
+        }
+        let mut avcc = vec![0, 0, 1, 0, 0x41];
+        avcc.extend(std::iter::repeat_n(42, 255));
+        assert_eq!(nal_units(&avcc, Some(4)).unwrap()[0], &avcc[4..]);
+    }
+
+    fn moving_image(width: usize, height: usize, frame: usize) -> YUVBuffer {
+        let mut pixels = vec![0; width * height * 4];
+        for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (index % width + frame * 7, index / width + frame * 3);
+            pixel.copy_from_slice(&[(x ^ y) as u8, (y * 3) as u8, (x * 5) as u8, 255]);
+        }
+        YUVBuffer::from_bgra8_source(BgraSliceU8::new(&pixels, (width, height)))
+    }
+
+    /// Real GPU encode/decode and resize/recovery check, using synthetic pixels only.
+    #[test]
+    #[ignore = "requires a local Windows hardware H.264 MFT"]
+    fn native_hardware_encode_decode_and_resize() {
+        for (width, height, fps) in [(640, 480, 60), (1920, 1080, 60), (800, 600, 60), (1920, 1080, 240)] {
+            let mut encoder = HardwareEncoder::new(width, height, 20_000_000, fps).unwrap();
+            println!("{} {width}x{height} at {fps} fps ceiling", encoder.name());
+            let mut decoder = Decoder::new().unwrap();
+            let mut timings = Vec::new();
+            for index in 0..20 {
+                let image = moving_image(width as usize, height as usize, index);
+                let timestamp = 1_798_500_000_000_000 + index as u64 * (1_000_000 / u64::from(fps));
+                let start = Instant::now();
+                let frames = encoder.encode(&image, timestamp, index == 10).unwrap();
+                timings.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(frames.len(), 1);
+                for frame in frames {
+                    assert_eq!(frame.capture_time_us, timestamp);
+                    let decoded = decoder.decode(&frame.data).unwrap().expect("no decoder frame buffering");
+                    assert_eq!(decoded.dimensions(), (width as usize, height as usize));
+                    if index == 0 || index == 10 {
+                        assert!(frame.keyframe, "requested recovery must produce IDR");
+                        let mut fresh = Decoder::new().unwrap();
+                        assert_eq!(
+                            fresh.decode(&frame.data).unwrap().unwrap().dimensions(),
+                            (width as usize, height as usize)
+                        );
+                    }
+                }
+            }
+            timings.sort_by(f64::total_cmp);
+            println!("hardware encode median={:.2}ms p95={:.2}ms", timings[10], timings[18]);
+        }
+    }
+}

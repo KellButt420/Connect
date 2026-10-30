@@ -5,6 +5,7 @@
 //! Progress arrives as [`ClientEvent`]s; the newest decoded frame and live [`Stats`] are read
 //! from the [`ClientHandle`].
 
+mod audio;
 mod video;
 
 use std::{
@@ -21,6 +22,7 @@ use connect_net::{self as net, PathKind};
 use connect_proto::{
     CLOSE_NORMAL, CLOSE_REJECTED, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
+    cursor::{CursorPosition, CursorShape},
     input::InputEvent,
     now_micros,
     video::FrameMeta,
@@ -47,11 +49,29 @@ pub enum Stage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
     Stage(Stage),
-    Accepted { host_name: String, width: u32, height: u32, permissions: Permissions },
+    Accepted {
+        host_name: String,
+        width: u32,
+        height: u32,
+        permissions: Permissions,
+    },
     PermissionsChanged(Permissions),
-    VideoFormat { width: u32, height: u32 },
+    VideoFormat {
+        width: u32,
+        height: u32,
+    },
     /// The host can't use this kind of input even though it's allowed; the text says why.
-    InputUnavailable { device: DeviceClass, reason: String },
+    InputUnavailable {
+        device: DeviceClass,
+        reason: String,
+    },
+    VideoEncoder {
+        name: String,
+    },
+    AudioStatus {
+        active: bool,
+        reason: Option<String>,
+    },
     /// Always the last event.
     Ended(EndReason),
 }
@@ -87,6 +107,12 @@ pub struct VideoFrame {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub meta: FrameMeta,
+}
+
+#[derive(Clone)]
+pub struct RemoteCursor {
+    pub position: CursorPosition,
+    pub shape: Option<Arc<CursorShape>>,
 }
 
 /// Figures for the stats overlay, refreshed about once a second.
@@ -132,6 +158,13 @@ struct Shared {
     frame: Mutex<Option<VideoFrame>>,
     stats: Mutex<Stats>,
     counters: Counters,
+    cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
+    cursor_sequence: AtomicU64,
+    playback: Mutex<Option<Arc<audio::Playback>>>,
+    audio_allowed: AtomicBool,
+    audio_muted: AtomicBool,
+    audio_generation: AtomicU64,
+    audio_failure: Mutex<Option<String>>,
 }
 
 /// Written by the receive and decode loops, summarised into [`Stats`] by the control loop.
@@ -163,6 +196,13 @@ pub fn connect(
         input: Mutex::new(None),
         frame: Mutex::new(None),
         stats: Mutex::new(Stats::default()),
+        cursor: Mutex::new((CursorPosition::default(), None, Instant::now())),
+        cursor_sequence: AtomicU64::new(0),
+        playback: Mutex::new(None),
+        audio_allowed: AtomicBool::new(false),
+        audio_muted: AtomicBool::new(false),
+        audio_generation: AtomicU64::new(0),
+        audio_failure: Mutex::new(None),
         counters: Counters {
             clock_offset_us: AtomicI64::new(i64::MIN),
             latency_us: AtomicI64::new(i64::MIN),
@@ -191,6 +231,31 @@ impl ClientHandle {
         *lock(&self.0.stats)
     }
 
+    pub fn cursor(&self) -> RemoteCursor {
+        let cursor = lock(&self.0.cursor);
+        let mut position = cursor.0;
+        if cursor.2.elapsed() > Duration::from_secs(1) {
+            position.visible = false;
+        }
+        RemoteCursor { position, shape: cursor.1.clone() }
+    }
+
+    /// Visual pointer telemetry; this never grants or injects mouse input.
+    pub fn send_cursor(&self, x: u16, y: u16, visible: bool) {
+        let position =
+            CursorPosition { seq: self.0.cursor_sequence.fetch_add(1, Ordering::Relaxed) as u32, x, y, visible };
+        if let Some(conn) = &*lock(&self.0.conn) {
+            let _ = conn.send_datagram(position.encode());
+        }
+    }
+
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.0.audio_muted.store(muted, Ordering::Relaxed);
+        if let Some(playback) = &*lock(&self.0.playback) {
+            playback.set_muted(muted);
+        }
+    }
+
     /// Sends input to the host, in order. Dropped unless a session is running; the host also
     /// drops anything its permissions don't allow.
     pub fn send_input(&self, event: InputEvent) {
@@ -209,6 +274,7 @@ impl ClientHandle {
     }
 }
 
+#[derive(Clone)]
 struct Events {
     tx: mpsc::Sender<ClientEvent>,
     shared: Arc<Shared>,
@@ -221,7 +287,13 @@ impl Events {
     }
 }
 
-async fn run(endpoint: &Endpoint, host: EndpointAddr, client_name: &str, shared: &Arc<Shared>, events: &Events) -> EndReason {
+async fn run(
+    endpoint: &Endpoint,
+    host: EndpointAddr,
+    client_name: &str,
+    shared: &Arc<Shared>,
+    events: &Events,
+) -> EndReason {
     events.send(ClientEvent::Stage(Stage::Connecting)).await;
     let conn = tokio::select! {
         conn = net::connect(endpoint, host) => match conn {
@@ -237,6 +309,7 @@ async fn run(endpoint: &Endpoint, host: EndpointAddr, client_name: &str, shared:
     }
 
     let result = session(&conn, client_name, shared, events).await;
+    stop_audio(shared);
     *lock(&shared.input) = None;
     let reason = match (conn.close_reason(), result) {
         (_, Ok(Some(reason))) => reason,
@@ -251,7 +324,12 @@ async fn run(endpoint: &Endpoint, host: EndpointAddr, client_name: &str, shared:
 
 /// Runs the handshake and, once allowed, the session. `Ok(Some(reason))` when the host said
 /// why it ended; otherwise the reason comes from how the connection closed.
-async fn session(conn: &Connection, client_name: &str, shared: &Arc<Shared>, events: &Events) -> Result<Option<EndReason>> {
+async fn session(
+    conn: &Connection,
+    client_name: &str,
+    shared: &Arc<Shared>,
+    events: &Events,
+) -> Result<Option<EndReason>> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: client_name.to_owned() };
     net::write_msg(&mut send, &hello).await?;
@@ -313,7 +391,20 @@ async fn stream(
                         shared.counters.clock_offset_us.store(offset, Ordering::Relaxed);
                     }
                 }
-                Some(Ok(HostMsg::PermissionsChanged(p))) => events.send(ClientEvent::PermissionsChanged(p)).await,
+                Some(Ok(HostMsg::PermissionsChanged(p))) => {
+                    if !p.allows(DeviceClass::Audio) { stop_audio(shared); }
+                    events.send(ClientEvent::PermissionsChanged(p)).await;
+                }
+                Some(Ok(HostMsg::VideoEncoder { name })) => events.send(ClientEvent::VideoEncoder { name }).await,
+                Some(Ok(HostMsg::CursorShape(shape))) => {
+                    anyhow::ensure!(shape.is_valid(), "invalid host cursor image");
+                    lock(&shared.cursor).1 = Some(Arc::new(shape));
+                    (shared.wake)();
+                }
+                Some(Ok(HostMsg::AudioStatus { active, reason })) => {
+                    if active { let _ = start_audio(shared.clone(), events.clone()); }
+                    else { stop_audio(shared); events.send(ClientEvent::AudioStatus { active, reason }).await; }
+                }
                 Some(Ok(HostMsg::VideoFormat { width, height })) => {
                     events.send(ClientEvent::VideoFormat { width, height }).await;
                 }
@@ -333,6 +424,11 @@ async fn stream(
                 }
             }
             _ = ping.tick() => {
+                let failure = lock(&shared.audio_failure).take();
+                if let Some(reason) = failure {
+                    stop_audio(shared);
+                    events.send(ClientEvent::AudioStatus { active: false, reason: Some(reason) }).await;
+                }
                 net::write_msg(&mut send, &ClientMsg::Ping { client_time_us: now_micros() }).await?;
                 window.update(conn, shared);
             }
@@ -340,6 +436,53 @@ async fn stream(
             _ = shared.disconnect.notified() => return Ok(Some(EndReason::Disconnected)),
         }
     }
+}
+
+fn stop_audio(shared: &Shared) {
+    shared.audio_allowed.store(false, Ordering::Release);
+    shared.audio_generation.fetch_add(1, Ordering::AcqRel);
+    let playback = lock(&shared.playback).take();
+    drop(playback);
+}
+
+fn start_audio(shared: Arc<Shared>, events: Events) -> Option<tokio::task::JoinHandle<()>> {
+    // A host packetizer restart changes capture epoch; the playback buffer handles it in place.
+    if shared.audio_allowed.load(Ordering::Acquire) {
+        return None;
+    }
+    stop_audio(&shared);
+    shared.audio_allowed.store(true, Ordering::Release);
+    let generation = shared.audio_generation.load(Ordering::Acquire);
+    Some(tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(audio::Playback::start).await;
+        match result {
+            Ok(Ok(playback)) => {
+                {
+                    let mut slot = lock(&shared.playback);
+                    if shared.audio_generation.load(Ordering::Acquire) != generation
+                        || !shared.audio_allowed.load(Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    playback.set_muted(shared.audio_muted.load(Ordering::Relaxed));
+                    *slot = Some(Arc::new(playback));
+                }
+                events.send(ClientEvent::AudioStatus { active: true, reason: None }).await;
+            }
+            other => {
+                if shared.audio_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                shared.audio_allowed.store(false, Ordering::Release);
+                let reason = match other {
+                    Ok(Err(error)) => format!("Desktop audio playback unavailable: {error:#}"),
+                    Err(error) => format!("Desktop audio playback stopped: {error}"),
+                    _ => unreachable!(),
+                };
+                events.send(ClientEvent::AudioStatus { active: false, reason: Some(reason) }).await;
+            }
+        }
+    }))
 }
 
 async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<Result<HostMsg>>) {
@@ -396,7 +539,11 @@ struct StatsWindow {
 impl StatsWindow {
     fn new(shared: &Shared) -> Self {
         let c = &shared.counters;
-        Self { at: Instant::now(), bytes: c.bytes.load(Ordering::Relaxed), frames: c.frames_decoded.load(Ordering::Relaxed) }
+        Self {
+            at: Instant::now(),
+            bytes: c.bytes.load(Ordering::Relaxed),
+            frames: c.frames_decoded.load(Ordering::Relaxed),
+        }
     }
 
     fn update(&mut self, conn: &Connection, shared: &Shared) {
@@ -425,4 +572,120 @@ impl StatsWindow {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    use connect_proto::{
+        CursorShape,
+        audio::{self, AudioPacket},
+        video::{self, FrameMeta},
+    };
+    use openh264::{
+        OpenH264API,
+        encoder::{Encoder, EncoderConfig, FrameRate},
+        formats::YUVBuffer,
+    };
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoked_or_disconnected_audio_startup_cannot_install_playback() {
+        let host = net::bind_local_endpoint(iroh::SecretKey::generate()).await.unwrap();
+        let endpoint = net::bind_local_endpoint(iroh::SecretKey::generate()).await.unwrap();
+        let (client, _events) = connect(endpoint.clone(), net::local_addr(&host), "startup probe", || {});
+        let (tx, _rx) = mpsc::channel(32);
+        let events = Events { tx, shared: client.0.clone() };
+        let worker = start_audio(client.0.clone(), events).unwrap();
+        stop_audio(&client.0);
+        client.disconnect();
+        tokio::time::timeout(Duration::from_secs(7), worker).await.unwrap().unwrap();
+        assert!(!client.0.audio_allowed.load(Ordering::Acquire));
+        assert!(lock(&client.0.playback).is_none());
+        endpoint.close().await;
+        host.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_datagrams_keep_cursor_and_video_independent() {
+        let host = net::bind_local_endpoint(iroh::SecretKey::generate()).await.unwrap();
+        let client_endpoint = net::bind_local_endpoint(iroh::SecretKey::generate()).await.unwrap();
+        let (client, mut events) = connect(client_endpoint.clone(), net::local_addr(&host), "media probe", || {});
+        let server_endpoint = host.clone();
+        let server = tokio::spawn(async move {
+            let conn = server_endpoint.accept().await.unwrap().accept().unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            assert!(matches!(
+                net::read_msg::<ClientMsg>(&mut recv).await.unwrap(),
+                Some(ClientMsg::Hello { version: PROTOCOL_VERSION, .. })
+            ));
+            net::write_msg(
+                &mut send,
+                &HostMsg::Welcome {
+                    host_name: "probe".into(),
+                    width: 16,
+                    height: 16,
+                    permissions: Permissions::VIEW_ONLY,
+                },
+            )
+            .await
+            .unwrap();
+            let shape = CursorShape { id: 99, width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, rgba: vec![255; 4] };
+            net::write_msg(&mut send, &HostMsg::CursorShape(shape)).await.unwrap();
+            let pcm = AudioPacket {
+                stream_id: 1,
+                sequence: 0,
+                first_frame: 0,
+                sample_rate: 48000,
+                channels: 2,
+                samples: vec![0.0; 120],
+            };
+            // Audio is ungranted: it must not open playback or corrupt video assembly.
+            conn.send_datagram(audio::encode(&pcm, 1200).unwrap()).unwrap();
+            conn.send_datagram(CursorPosition { seq: 2, x: 123, y: 456, visible: true }.encode()).unwrap();
+            let mut encoder = Encoder::with_api_config(
+                OpenH264API::from_source(),
+                EncoderConfig::new().max_frame_rate(FrameRate::from_hz(60.0)),
+            )
+            .unwrap();
+            let image = YUVBuffer::new(16, 16);
+            let encoded = encoder.encode(&image).unwrap().to_vec();
+            let meta = FrameMeta { seq: 0, keyframe: true, capture_time_us: now_micros(), encode_time_us: 0 };
+            for chunk in video::packetize(meta, &encoded, 1200).unwrap() {
+                conn.send_datagram(chunk).unwrap();
+            }
+            conn.closed().await;
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await.expect("client event stream remains open") {
+                    ClientEvent::Accepted { .. } => break,
+                    ClientEvent::Ended(reason) => panic!("media probe ended early: {reason}"),
+                    _ => {}
+                }
+            }
+            let mut saw_video = false;
+            loop {
+                if let Some(frame) = client.take_frame() {
+                    assert_eq!((frame.width, frame.height), (16, 16));
+                    saw_video = true;
+                }
+                let cursor = client.cursor();
+                if saw_video
+                    && cursor.position.x == 123
+                    && cursor.position.visible
+                    && cursor.shape.as_ref().is_some_and(|s| s.id == 99)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mixed media delivers video and cursor independently");
+        assert!(lock(&client.0.playback).is_none());
+        client.disconnect();
+        server.await.unwrap();
+        client_endpoint.close().await;
+        host.close().await;
+    }
 }

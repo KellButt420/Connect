@@ -33,7 +33,9 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
         }
     }
     if video == VideoSource::Screen && !VideoSource::SCREEN_SUPPORTED {
-        bail!("hosting needs Windows; this PC can only connect to others (`--test-pattern` serves a test image, for development)");
+        bail!(
+            "hosting needs Windows; this PC can only connect to others (`--test-pattern` serves a test image, for development)"
+        );
     }
 
     let endpoint = net::bind_endpoint(key).await?;
@@ -44,7 +46,8 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
         Err(_) => println!("no relay reachable yet; only direct connections will work for now."),
     }
 
-    let (host, mut events) = connect_host::start(endpoint.clone(), HostConfig { video, input, ..HostConfig::new(device_name()) });
+    let (host, mut events) =
+        connect_host::start(endpoint.clone(), HostConfig { video, input, ..HostConfig::new(device_name()) });
     let mut lines = stdin_lines();
 
     loop {
@@ -57,7 +60,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
                 while lines.try_recv().is_ok() {} // ignore anything typed before the question
                 println!("\n{} wants to connect to this PC.", request.client_name);
                 println!("  Their User-ID: {}", net::format_user_id(&request.peer));
-                println!("Allow? [y/N] (no answer = deny in 30 s)");
+                println!("Allow screen, desktop audio, mouse, keyboard and gamepads? [y/N] (no answer = deny in 30 s)");
                 let answer = loop {
                     tokio::select! {
                         line = lines.recv() => break line,
@@ -123,6 +126,11 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 Some(ClientEvent::PermissionsChanged(p)) => println!("Host changed permissions to {:#05b}.", p.bits()),
                 Some(ClientEvent::VideoFormat { width, height }) => println!("Host screen is now {width}×{height}."),
                 Some(ClientEvent::InputUnavailable { reason, .. }) => println!("{reason}"),
+                Some(ClientEvent::VideoEncoder { name }) => println!("Video encoder: {name}"),
+                Some(ClientEvent::AudioStatus { active, reason }) => {
+                    if let Some(reason) = reason { println!("{reason}"); }
+                    else { println!("Desktop audio: {}", if active { "on" } else { "off" }); }
+                },
                 Some(ClientEvent::Ended(reason)) => {
                     println!("{reason}");
                     break;

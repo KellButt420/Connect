@@ -212,6 +212,11 @@ struct ClientSession {
     started: Instant,
     state: ClientState,
     video: Option<egui::TextureHandle>,
+    host_cursor_texture: Option<(u64, egui::TextureHandle)>,
+    encoder: String,
+    audio_active: bool,
+    audio_muted: bool,
+    shelf_open: bool,
     show_stats: bool,
     input: input::InputCapture,
     gamepads: Option<gamepad::Forwarder>,
@@ -313,12 +318,10 @@ impl App {
             return;
         }
         let ctx = ctx.clone();
-        let (handle, events) = connect_client::connect(
-            self.endpoint.clone(),
-            host_id,
-            self.settings.device_name.clone(),
-            move || ctx.request_repaint(),
-        );
+        let (handle, events) =
+            connect_client::connect(self.endpoint.clone(), host_id, self.settings.device_name.clone(), move || {
+                ctx.request_repaint()
+            });
         self.client = Some(ClientSession {
             handle,
             events,
@@ -326,6 +329,11 @@ impl App {
             started: Instant::now(),
             state: ClientState::Connecting,
             video: None,
+            host_cursor_texture: None,
+            encoder: "Starting encoder…".into(),
+            audio_active: false,
+            audio_muted: false,
+            shelf_open: true,
             show_stats: false,
             input: input::InputCapture::default(),
             gamepads: None,
@@ -360,6 +368,13 @@ impl App {
                     }
                 }
                 ClientEvent::InputUnavailable { reason, .. } => client.note(reason, 10),
+                ClientEvent::VideoEncoder { name } => client.encoder = name,
+                ClientEvent::AudioStatus { active, reason } => {
+                    client.audio_active = active;
+                    if let Some(reason) = reason {
+                        client.note(reason, 10);
+                    }
+                }
                 ClientEvent::VideoFormat { .. } => {}
                 ClientEvent::Ended(reason) => ended = Some(reason),
             }
@@ -447,7 +462,10 @@ fn permission_change(before: Permissions, now: Permissions) -> String {
 
 /// Passes host events to the UI, waking it and bringing the window forward for a request,
 /// even when it's minimised.
-fn forward_host_events(mut events: mpsc::Receiver<HostEvent>, ctx: egui::Context) -> mpsc::UnboundedReceiver<HostEvent> {
+fn forward_host_events(
+    mut events: mpsc::Receiver<HostEvent>,
+    ctx: egui::Context,
+) -> mpsc::UnboundedReceiver<HostEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {

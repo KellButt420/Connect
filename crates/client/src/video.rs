@@ -84,6 +84,37 @@ pub(crate) async fn receive(
     let mut damage_reported = 0;
     while let Ok(datagram) = conn.read_datagram().await {
         shared.counters.bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+        match datagram.first().copied() {
+            Some(connect_proto::audio::KIND_AUDIO) => {
+                if shared.audio_allowed.load(Ordering::Acquire) {
+                    let playback = lock(&shared.playback).clone();
+                    if let Some(playback) = playback
+                        && let Err(error) = playback.push_datagram(&datagram)
+                    {
+                        shared.audio_allowed.store(false, Ordering::Release);
+                        *lock(&shared.audio_failure) = Some(format!("Desktop audio playback stopped: {error:#}"));
+                    }
+                }
+                continue;
+            }
+            Some(connect_proto::cursor::KIND_CURSOR) => {
+                if let Ok(position) = connect_proto::CursorPosition::decode(&datagram) {
+                    let mut cursor = lock(&shared.cursor);
+                    if position.is_newer_than(cursor.0.seq) || cursor.2.elapsed() > std::time::Duration::from_secs(1) {
+                        let moved =
+                            (position.x, position.y, position.visible) != (cursor.0.x, cursor.0.y, cursor.0.visible);
+                        cursor.0 = position;
+                        cursor.2 = Instant::now();
+                        drop(cursor);
+                        if moved {
+                            (shared.wake)();
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
         match assembler.push(datagram) {
             Ok(Some(frame)) => match frames.try_send(frame) {
                 Ok(()) => {}

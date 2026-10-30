@@ -1,5 +1,8 @@
 //! The capture → H.264 encode thread behind a session.
 
+#[cfg(windows)]
+mod mf;
+
 use std::{
     sync::{
         Arc,
@@ -38,6 +41,9 @@ pub(crate) enum VideoEvent {
         height: u32,
     },
     Frame(EncodedFrame),
+    Encoder {
+        name: String,
+    },
 }
 
 /// Runs capture and encode on a dedicated thread, which stops when this is dropped.
@@ -100,6 +106,78 @@ fn encoder_config(bitrate_bps: u32) -> EncoderConfig {
         .intra_frame_period(IntraFramePeriod::from_num_frames(INTRA_PERIOD_FRAMES))
 }
 
+enum VideoEncoder {
+    Software(Box<Encoder>),
+    #[cfg(windows)]
+    Hardware(mf::HardwareEncoder),
+}
+
+struct Picture {
+    data: Bytes,
+    keyframe: bool,
+    capture_time_us: u64,
+}
+
+impl VideoEncoder {
+    fn software(bitrate_bps: u32) -> Result<Self> {
+        Ok(Self::Software(Box::new(Encoder::with_api_config(OpenH264API::from_source(), encoder_config(bitrate_bps))?)))
+    }
+
+    fn new(source: &VideoSource, width: u32, height: u32, bitrate_bps: u32) -> Result<Self> {
+        #[cfg(windows)]
+        if *source == VideoSource::Screen {
+            match mf::HardwareEncoder::new(width, height, bitrate_bps, MAX_FPS as u32) {
+                Ok(encoder) => return Ok(Self::Hardware(encoder)),
+                Err(error) => tracing::warn!("GPU encoder unavailable; using OpenH264: {error:#}"),
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (source, width, height);
+        Self::software(bitrate_bps)
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Software(_) => "CPU: OpenH264",
+            #[cfg(windows)]
+            Self::Hardware(encoder) => encoder.name(),
+        }
+    }
+
+    fn encode(&mut self, image: &YUVBuffer, capture_time_us: u64, force_keyframe: bool) -> Result<Vec<Picture>> {
+        match self {
+            Self::Software(encoder) => {
+                if force_keyframe {
+                    encoder.force_intra_frame();
+                }
+                let encoded = encoder.encode_at(image, openh264::Timestamp::from_millis(capture_time_us / 1000))?;
+                if encoded.frame_type() == FrameType::Skip {
+                    return Ok(Vec::new());
+                }
+                let data = encoded.to_vec();
+                if data.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![Picture {
+                    data: data.into(),
+                    keyframe: encoded.frame_type() == FrameType::IDR,
+                    capture_time_us,
+                }])
+            }
+            #[cfg(windows)]
+            Self::Hardware(encoder) => Ok(encoder
+                .encode(image, capture_time_us, force_keyframe)?
+                .into_iter()
+                .map(|frame| Picture {
+                    data: frame.data.into(),
+                    keyframe: frame.keyframe,
+                    capture_time_us: frame.capture_time_us,
+                })
+                .collect()),
+        }
+    }
+}
+
 fn run(
     source: &VideoSource,
     bitrate_bps: u32,
@@ -108,17 +186,17 @@ fn run(
     stop: &AtomicBool,
 ) -> Result<()> {
     let mut capturer = source.open()?;
-    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), encoder_config(bitrate_bps))
-        .context("starting H.264 encoder")?;
+    let mut encoder = None;
     // The last captured image, kept so a keyframe can be sent while the screen is static.
     let mut yuv: Option<YUVBuffer> = None;
     let mut packed = Vec::new();
-    let mut bitstream = Vec::new();
     let mut seq = 0u32;
+    let clock_start = now_micros();
+    let stream_start = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let frame = capturer.next_frame(POLL)?;
-        let capture_time_us = now_micros();
+        let capture_time_us = clock_start + stream_start.elapsed().as_micros() as u64;
         match frame {
             Some(frame) => {
                 // 4:2:0 chroma needs even dimensions; drop an odd last row/column.
@@ -129,6 +207,11 @@ fn run(
                     if tx.blocking_send(Ok(VideoEvent::Format { width: w, height: h })).is_err() {
                         return Ok(());
                     }
+                    let selected = VideoEncoder::new(source, w, h, bitrate_bps).context("starting H.264 encoder")?;
+                    if tx.blocking_send(Ok(VideoEvent::Encoder { name: selected.name().to_owned() })).is_err() {
+                        return Ok(());
+                    }
+                    encoder = Some(selected);
                 }
                 let buf = yuv.as_mut().expect("set above");
                 buf.read_bgra8(BgraSliceU8::new(packed_bgra(&frame, w, h, &mut packed), (w as usize, h as usize)));
@@ -138,29 +221,31 @@ fn run(
         }
         let Some(image) = &yuv else { continue };
 
-        if keyframe.swap(false, Ordering::Relaxed) {
-            encoder.force_intra_frame();
-        }
+        let force_keyframe = keyframe.swap(false, Ordering::Relaxed);
         let started = Instant::now();
-        let encoded = encoder.encode(image).context("encoding frame")?;
-        let frame_type = encoded.frame_type();
-        bitstream.clear();
-        encoded.write_vec(&mut bitstream);
-        if bitstream.is_empty() || frame_type == FrameType::Skip {
-            continue;
-        }
-
-        let meta = FrameMeta {
-            seq,
-            // Only IDR frames carry SPS/PPS and reset references, so only they let a decoder (re)start.
-            keyframe: frame_type == FrameType::IDR,
-            capture_time_us,
-            encode_time_us: started.elapsed().as_micros() as u32,
+        let active = encoder.as_mut().expect("encoder initialized with the image");
+        let pictures = match active.encode(image, capture_time_us, force_keyframe) {
+            Ok(pictures) => pictures,
+            Err(error) => {
+                if matches!(active, VideoEncoder::Software(_)) {
+                    return Err(error.context("encoding frame"));
+                }
+                tracing::warn!("GPU encoding failed; recovering on OpenH264: {error:#}");
+                *active = VideoEncoder::software(bitrate_bps)?;
+                if tx.blocking_send(Ok(VideoEvent::Encoder { name: active.name().to_owned() })).is_err() {
+                    return Ok(());
+                }
+                active.encode(image, capture_time_us, true)?
+            }
         };
-        seq = seq.wrapping_add(1);
-        let frame = EncodedFrame { meta, data: Bytes::copy_from_slice(&bitstream) };
-        if tx.blocking_send(Ok(VideoEvent::Frame(frame))).is_err() {
-            return Ok(());
+        let encode_time_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        for picture in pictures {
+            let meta =
+                FrameMeta { seq, keyframe: picture.keyframe, capture_time_us: picture.capture_time_us, encode_time_us };
+            seq = seq.wrapping_add(1);
+            if tx.blocking_send(Ok(VideoEvent::Frame(EncodedFrame { meta, data: picture.data }))).is_err() {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -187,7 +272,7 @@ mod tests {
 
     fn moving_image(width: usize, height: usize, frame: usize) -> YUVBuffer {
         let mut pixels = vec![0; width * height * 4];
-        for (i, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+        for (i, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = (i % width + frame * 7, i / width + frame * 3);
             pixel.copy_from_slice(&[(x ^ y) as u8, (y * 3) as u8, (x * 5) as u8, 255]);
         }

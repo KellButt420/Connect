@@ -1,5 +1,38 @@
 # Video stutter investigation
 
+## Version 0.3 media update
+
+Windows screen sharing now selects an actual Media Foundation hardware H.264 encoder when
+available. Low-delay mode, no B frames and bounded in-flight work avoid adding a video queue.
+Hardware errors recover on the parallel OpenH264 encoder with a new keyframe. The shelf names
+the encoder in use. Capture still reads pixels back to the CPU, converts to I420 and packs
+NV12 for the hardware encoder. Video decoding and texture upload still run on the client CPU/GUI.
+
+Host and viewer cursors use independent updates so a static or delayed video frame does not
+hold back pointer visibility. GUI input is sent before color conversion and texture upload.
+Gamepad state is forwarded for each queued event rather than after draining the entire queue,
+preserving quick press/release transitions. Reliable input and host permission checks remain.
+
+Desktop PCM audio has independent bounded queues (20 ms playback target, 80 ms maximum) and
+fills missing packets with silence. Muting flushes pending audio. Audio is a separate host
+permission, stops on revocation, and restarts its packetizer if the path's datagram limit shrinks.
+The preferred 48 kHz stereo float stream costs about 3.1 Mbps before transport overhead.
+
+Local Windows verification on 2026-10-29 used an NVIDIA GeForce RTX 5060. The hardware probe
+encoded and decoded 640×480, 1920×1080 and 800×600 frames, recreated the encoder on resize,
+checked a forced keyframe with a fresh decoder, and checked timestamp preservation. A 240 Hz
+configuration was accepted; this is not a sustained 240 FPS benchmark. Native audio testing
+captured a quiet center-channel tone from the 96 kHz/8-channel endpoint into both stereo
+channels, with no packet timeline gaps, and reopened capture cleanly. Native cursor testing
+checked click-through, focus, capture exclusion, stale hiding, cleanup and GDI handle stability.
+A localhost desktop session verified GPU video, cursor delivery, audio enable/revoke and shutdown.
+All 79 workspace tests passed, including the opt-in native probes and the rendered shelf/input
+isolation check. `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` passed.
+
+Physical two-PC gaming, AMD/Intel hardware transforms, Linux playback and exclusive fullscreen
+overlay behavior have not been measured here. The notes below describe the earlier software
+optimization and remaining pipeline risks; no zero-delay or universal FPS claim is made.
+
 ## Confirmed bottleneck and change
 
 `crates/host/src/encode.rs` previously used OpenH264's default single-slice configuration.
@@ -72,14 +105,14 @@ Initial pre-fork benchmark executable SHA-256 (the v0.2.2 release has its own at
 
 ## Remaining limits
 
-This is still a software codec. GPU readback, color conversion, the single decoder thread,
-and texture upload can also limit high-refresh streaming. Frame queues and the wire
-protocol are unchanged; this change adds no buffering or playback delay. Actual perceived
+The software fallback, GPU readback, color conversion, the single decoder thread,
+and texture upload can also limit high-refresh streaming. The earlier slice change left frame
+queues and the wire protocol unchanged. Version 0.3 requires both peers to update. Actual perceived
 stutter and input latency must be checked with a game between two PCs.
 
 To try the local build, run `target/release/connect.exe` on the host and reconnect from
-the existing client. Toggle stats with Ctrl+Alt+S and compare encode time and visible
-motion in the same game scene. The existing client remains compatible.
+another updated client. Toggle stats with Ctrl+Alt+S and compare encode time and visible
+motion in the same game scene.
 
 ## Follow-up: other concrete stutter paths
 

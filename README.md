@@ -1,21 +1,22 @@
 # Connect
 
-Performance fork of [volsatl9/Connect](https://github.com/volsatl9/Connect). This fork enables
-parallel software encoding, includes high-refresh streaming regression tests, and uses its
-own release channel for app updates. The protocol remains compatible with upstream v0.2.1.
+Performance fork of [volsatl9/Connect](https://github.com/volsatl9/Connect), with desktop audio,
+automatic GPU encoding, two-way cursor visibility, and compact session controls.
+Version 0.3 uses protocol 3: **update both PCs**. Older peers receive a version mismatch message.
 See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
 Account** to get a User-ID. Give it to someone and they can connect to your PC from anywhere:
 direct P2P when possible, through a relay when not. You allow or deny every connection, and choose
-whether they may use your mouse, keyboard and gamepad. You can switch each one on or off at any time.
+whether they may use your mouse, keyboard and gamepad, or hear desktop audio. You can switch
+each permission on or off at any time.
 
 ## Status
 
 | | |
 |---|---|
-| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, the host's screen at its display's refresh rate (60–240 Hz), remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
-| Not yet | Audio, hardware (GPU) video encoding, the mouse pointer drawn in the stream, picking a monitor |
+| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio with viewer mute, automatic hardware H.264 with CPU fallback, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
+| Not yet | Monitor selection, microphone sharing, GPU-only capture/conversion, hardware video decoding |
 | Platforms | Windows can host and connect. Linux can connect only |
 
 ## Download
@@ -45,6 +46,27 @@ programs, run Connect as administrator on the host.
 
 ## While connected
 
+The opaque shelf on the left contains fullscreen, mouse capture, audio mute, stats and
+disconnect controls. Collapse it with the arrow; shortcuts remain available while the mouse
+is captured. The shelf's clicks stay local.
+
+Windows hosts automatically try a Media Foundation hardware H.264 encoder and fall back to
+parallel OpenH264 if initialization or encoding fails. The shelf reports the actual encoder.
+High-refresh sources are supported up to 240 Hz, subject to capture, encoder, network, decoder
+and display throughput; this does not guarantee 240 decoded frames per second.
+
+Desktop audio uses uncompressed floating-point PCM, preferably the Windows engine's 48 kHz
+stereo mix (about 3.1 Mbps before transport). There is no lossy audio codec; Windows may downmix
+or resample the output device. No microphone is recorded. The host must allow **Desktop audio**;
+existing saved permission sets leave it off until enabled. Missing audio devices leave video
+and input working. The viewer can mute playback independently.
+
+Cursor updates travel independently of video. The host sees a cyan viewer pointer that cannot
+take focus or intercept clicks, including view-only sessions. It hides during relative mouse
+capture and after updates stop. Windows may cover the overlay in exclusive fullscreen; animated
+cursor shapes currently use their first frame. If Windows cannot exclude the viewer overlay
+from capture, the overlay is hidden to prevent duplicate pointers.
+
 | Keys | |
 |---|---|
 | Ctrl+Alt+M | Capture the mouse for games (raw movement, hidden pointer), and release it again |
@@ -65,15 +87,19 @@ cargo build --release -p connect                                    # Linux
 cargo test --workspace
 ```
 
+Native Linux builds also need the ALSA and udev development packages (`libasound2-dev`,
+`libudev-dev` and `pkg-config` on Ubuntu) for audio playback and gamepad input.
+
 NASM is needed at build time for OpenH264's assembly optimizations. Without it, the dependency
 silently falls back to slower C++ code. On native Windows builds, use the Visual Studio C++
 toolchain and put `nasm.exe` on PATH, or set the `NASM` environment variable to its full path.
 If OpenH264 was already built without NASM, run `cargo clean -p openh264-sys2 --release`
 before rebuilding the release executable (omit `--release` for a dev/test build).
 
-The software encoder uses multiple slices and up to four workers to reduce frame processing
-stalls while keeping CPU use bounded. See [performance notes](PERFORMANCE.md) for verification
-and remaining limits.
+The software fallback uses multiple slices and up to four workers to reduce frame processing
+stalls while keeping CPU use bounded. Input is forwarded before GUI image upload, and queued
+gamepad transitions are preserved. Network and display latency still apply. See
+[performance notes](PERFORMANCE.md) for verification and remaining limits.
 
 ## Headless commands
 

@@ -283,6 +283,105 @@ async fn shutdown_releases_input_before_returning() {
     timeout(WAIT, host.shutdown()).await.expect("a second shutdown returns at once");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn rapid_gamepad_edges_and_visual_pointer_preserve_input_permissions() {
+    let (sink, mut injected) = mpsc::unbounded_channel();
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (_ep, client, mut events) = start_client(&host_ep).await;
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
+    accepted(&mut events).await;
+    let down =
+        InputEvent::Gamepad { pad: 0, state: GamepadState { buttons: GamepadState::A, ..GamepadState::NEUTRAL } };
+    let up = InputEvent::Gamepad { pad: 0, state: GamepadState::NEUTRAL };
+    client.send_cursor(123, 456, true);
+    client.send_input(down);
+    client.send_input(up);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), down);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), up);
+    host.set_permissions(Permissions::VIEW_ONLY);
+    loop {
+        if matches!(next(&mut events).await, ClientEvent::PermissionsChanged(Permissions::VIEW_ONLY)) {
+            break;
+        }
+    }
+    client.send_cursor(500, 600, true);
+    assert!(
+        timeout(Duration::from_millis(50), injected.recv()).await.is_err(),
+        "visual pointer telemetry must never inject mouse input"
+    );
+    client.disconnect();
+    timeout(WAIT, host.shutdown()).await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "captures the local desktop over localhost, requires GPU and audio devices"]
+async fn native_desktop_gpu_cursor_audio_and_revocation() {
+    let (sink, _injected) = mpsc::unbounded_channel();
+    let cfg = HostConfig {
+        video: VideoSource::Screen,
+        input: InputSink::Channel(sink),
+        ..HostConfig::new("Native media probe")
+    };
+    let (host_ep, host, mut host_events) = start_host(cfg).await;
+    let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+    // Same-PC loopback playback must stay silent to avoid recapturing its own output.
+    client.set_audio_muted(true);
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::VIEW_ONLY));
+    accepted(&mut client_events).await;
+    let mut gpu = false;
+    let mut frames = 0;
+    timeout(WAIT, async {
+        while !(gpu && frames >= 5 && client.cursor().shape.is_some()) {
+            while let Ok(event) = client_events.try_recv() {
+                match event {
+                    ClientEvent::VideoEncoder { name } => {
+                        println!("Native session encoder: {name}");
+                        gpu = name.starts_with("GPU:");
+                    }
+                    ClientEvent::Ended(reason) => panic!("native session ended: {reason}"),
+                    _ => {}
+                }
+            }
+            if let Some(frame) = client.take_frame() {
+                assert!(frame.width > 0 && frame.height > 0);
+                frames += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("GPU desktop video and independent host cursor arrive");
+    client.send_cursor(20000, 30000, true);
+    host.set_permissions(Permissions::VIEW_ONLY.with(DeviceClass::Audio, true));
+    timeout(WAIT, async {
+        loop {
+            match next(&mut client_events).await {
+                ClientEvent::AudioStatus { active: true, .. } => break,
+                ClientEvent::AudioStatus { reason: Some(reason), .. } => panic!("audio unavailable: {reason}"),
+                ClientEvent::Ended(reason) => panic!("session ended: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    host.set_permissions(Permissions::VIEW_ONLY);
+    timeout(WAIT, async {
+        loop {
+            if matches!(next(&mut client_events).await, ClientEvent::AudioStatus { active: false, reason: None }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client.send_cursor(0, 0, false);
+    client.disconnect();
+    timeout(WAIT, host.shutdown()).await.unwrap();
+    println!("Native localhost session passed: GPU video, cursor, audio startup/revocation, clean shutdown");
+}
+
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn only_windows_can_host() {
