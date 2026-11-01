@@ -57,8 +57,8 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     };
     // Where hardware decoding is wanted and the graphics card decodes through Vulkan, the window
     // renders with the decoder's own device, so decoded pictures go straight to the screen.
-    // Otherwise wgpu picks a device itself: Vulkan, or Direct3D 12 (Windows) or OpenGL (Linux)
-    // where Vulkan is missing.
+    // Otherwise wgpu picks a device itself: Vulkan, or Direct3D 12 (Windows) or OpenGL where
+    // Vulkan is missing.
     let shared_gpu = (Settings::saved().hardware_decoding
         && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
     .then(|| match connect_client::SharedGpu::open() {

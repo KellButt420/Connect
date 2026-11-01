@@ -20,8 +20,8 @@ cpal = "0.17.3"
 iroh = "1.4"
 openh264 = "0.9"
 opus = "0.4"
-# Only the backends Connect draws with: Vulkan everywhere, plus Direct3D 12 on Windows and OpenGL
-# on Linux (added per platform in connect-client), not wgpu's web and macOS backends.
+# Only the backends Connect draws with: Vulkan everywhere, plus Direct3D 12 and OpenGL on Windows and
+# OpenGL on Linux (added per platform in connect-client), not wgpu's web and macOS backends.
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }
 gpu-video = { path = "crates/gpu-video", default-features = false }
 postcard = { version = "1", features = ["use-std"] }
