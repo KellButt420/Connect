@@ -19,7 +19,7 @@
 //! `start /wait connect.exe …` so the terminal waits for them.
 //!
 //! Set `CONNECT_CONFIG_DIR` to use a separate identity, e.g. to run two copies on one PC, and
-//! `CONNECT_RENDERER=glow` if the window stays blank (falls back from wgpu to plain OpenGL).
+//! `CONNECT_RENDERER=separate` to keep the window off the video decoder's graphics device.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use connect_client::Stats;
 use connect_net as net;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::Targets, prelude::*};
 
 const USAGE: &str = "\
 usage: connect                        open the app
@@ -49,9 +49,11 @@ fn main() -> Result<()> {
     if !args.is_empty() {
         attach_parent_console();
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,iroh=warn,noq=warn".into()))
-        .init();
+    // RUST_LOG as targets and levels only (e.g. "debug,iroh=info"): unlike a full EnvFilter, no
+    // regex engine, and spans below the level are never created.
+    let filter = std::env::var("RUST_LOG").ok().and_then(|value| value.parse::<Targets>().ok());
+    let filter = filter.unwrap_or_else(|| "info,iroh=warn,noq=warn".parse().expect("valid default filter"));
+    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).init();
     update::clean_up_previous();
 
     if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
@@ -63,7 +65,10 @@ fn main() -> Result<()> {
         Some(dir) => PathBuf::from(dir),
         None => net::default_config_dir()?,
     };
-    let runtime = tokio::runtime::Runtime::new()?;
+    // A few workers are plenty for the network and session tasks (video has threads of its own);
+    // one per core only costs memory on many-core PCs.
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build()?;
     // The app asks before creating an account; the terminal commands just make one.
     let key = || net::load_or_create_identity(&config_dir);
 

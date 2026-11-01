@@ -17,3 +17,11 @@ gpu-video = { workspace = true, features = ["wgpu"] }
 wgpu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# Fallbacks for PCs without a usable Vulkan driver: Direct3D 12 (which also covers the software
+# adapter in virtual machines) on Windows, OpenGL on Linux.
+[target.'cfg(windows)'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["gles"] }

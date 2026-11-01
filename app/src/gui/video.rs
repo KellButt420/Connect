@@ -7,16 +7,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use connect_client::{ClientHandle, VideoFrame};
 use eframe::{
     egui::{self, Color32, ColorImage, Rect, TextureHandle, TextureOptions},
-    egui_glow, egui_wgpu, glow, wgpu,
+    egui_wgpu, wgpu,
 };
 
 /// What the window draws with; set once at startup.
 #[derive(Clone, Copy, Debug)]
 pub enum Gpu {
-    /// Direct3D 12, Vulkan or Metal through wgpu, into a target of this format.
+    /// Vulkan, Direct3D 12 or OpenGL through wgpu, into a target of this format.
     Wgpu(wgpu::TextureFormat),
-    /// OpenGL 3 / GLES 3 or newer.
-    Glow,
     /// Nothing the shader runs on: frames are converted to RGBA on the CPU.
     Cpu,
 }
@@ -25,14 +23,7 @@ static GPU: OnceLock<Gpu> = OnceLock::new();
 
 /// Records what the window renders with; call before any [`VideoView`] is made.
 pub fn init(cc: &eframe::CreationContext<'_>) {
-    let gpu = if let Some(state) = &cc.wgpu_render_state {
-        Gpu::Wgpu(state.target_format)
-    } else if let Some(gl) = &cc.gl {
-        let version = egui_glow::ShaderVersion::get(gl);
-        if version.is_new_shader_interface() { Gpu::Glow } else { Gpu::Cpu }
-    } else {
-        Gpu::Cpu
-    };
+    let gpu = if let Some(state) = &cc.wgpu_render_state { Gpu::Wgpu(state.target_format) } else { Gpu::Cpu };
     tracing::debug!(?gpu, "video renderer");
     let _ = GPU.set(gpu);
 }
@@ -112,13 +103,6 @@ impl VideoView {
         match gpu() {
             Gpu::Wgpu(format) => {
                 painter.add(egui_wgpu::Callback::new_paint_callback(rect, WgpuVideo { exchange, format }));
-            }
-            Gpu::Glow => {
-                let callback = egui_glow::CallbackFn::new(move |_, painter| {
-                    // SAFETY: called by egui_glow while painting, with its context current.
-                    unsafe { paint_gl(painter.gl(), &exchange) };
-                });
-                painter.add(egui::PaintCallback { rect, callback: Arc::new(callback) });
             }
             Gpu::Cpu => {
                 if let Some((texture, _)) = &self.cpu {
@@ -430,150 +414,6 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
             None => return,
         }
         render_pass.draw(0..3, 0..1);
-    }
-}
-
-// ---- OpenGL -------------------------------------------------------------------------------
-
-const GL_VERTEX: &str = r#"
-out vec2 uv;
-void main() {
-    uv = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
-}
-"#;
-
-const GL_FRAGMENT: &str = r#"
-in vec2 uv;
-out vec4 color;
-uniform sampler2D y_plane;
-uniform sampler2D u_plane;
-uniform sampler2D v_plane;
-void main() {
-    float y = (texture(y_plane, uv).r - 16.0 / 255.0) * 1.164383;
-    float u = texture(u_plane, uv).r - 128.0 / 255.0;
-    float v = texture(v_plane, uv).r - 128.0 / 255.0;
-    vec3 rgb = vec3(y + 1.596027 * v, y - 0.391762 * u - 0.812968 * v, y + 2.017232 * u);
-    color = vec4(clamp(rgb, 0.0, 1.0), 1.0);
-}
-"#;
-
-/// The window's OpenGL objects for the video, made on first use. There's only the one context.
-struct GlResources {
-    program: glow::Program,
-    vertex_array: glow::VertexArray,
-    textures: [glow::Texture; 3],
-    size: Option<[u32; 2]>,
-}
-
-static GL: Mutex<Option<Result<GlResources, String>>> = Mutex::new(None);
-
-unsafe fn paint_gl(gl: &glow::Context, exchange: &Mutex<Exchange>) {
-    use glow::HasContext as _;
-    let mut slot = lock(&GL);
-    let resources = match slot.get_or_insert_with(|| unsafe { GlResources::new(gl) }) {
-        Ok(resources) => resources,
-        Err(_) => return,
-    };
-    unsafe {
-        let mut exchange = lock(exchange);
-        if let Some(mut frame) = exchange.next.take() {
-            let size = [frame.width, frame.height];
-            let resize = resources.size != Some(size);
-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            for (texture, (width, height, bytes)) in resources.textures.iter().zip(planes(&frame)) {
-                gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
-                let pixels = glow::PixelUnpackData::Slice(Some(bytes));
-                if resize {
-                    let (w, h) = (width as i32, height as i32);
-                    gl.tex_image_2d(
-                        glow::TEXTURE_2D,
-                        0,
-                        glow::R8 as i32,
-                        w,
-                        h,
-                        0,
-                        glow::RED,
-                        glow::UNSIGNED_BYTE,
-                        pixels,
-                    );
-                } else {
-                    let (w, h) = (width as i32, height as i32);
-                    gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w, h, glow::RED, glow::UNSIGNED_BYTE, pixels);
-                }
-            }
-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-            resources.size = Some(size);
-            frame.timing.mark_painted();
-            exchange.done.push(frame);
-        }
-        if resources.size.is_none() {
-            return;
-        }
-        gl.use_program(Some(resources.program));
-        gl.bind_vertex_array(Some(resources.vertex_array));
-        gl.disable(glow::BLEND);
-        for (unit, texture) in resources.textures.iter().enumerate() {
-            gl.active_texture(glow::TEXTURE0 + unit as u32);
-            gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
-        }
-        gl.draw_arrays(glow::TRIANGLES, 0, 3);
-        gl.active_texture(glow::TEXTURE0);
-    }
-}
-
-impl GlResources {
-    unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
-        use glow::HasContext as _;
-        let version = egui_glow::ShaderVersion::get(gl);
-        let header = format!(
-            "{}{}",
-            version.version_declaration(),
-            if version.is_embedded() { "precision mediump float;\n" } else { "" }
-        );
-        unsafe {
-            let program = gl.create_program()?;
-            let mut shaders = Vec::new();
-            for (kind, source) in [(glow::VERTEX_SHADER, GL_VERTEX), (glow::FRAGMENT_SHADER, GL_FRAGMENT)] {
-                let shader = gl.create_shader(kind)?;
-                gl.shader_source(shader, &format!("{header}{source}"));
-                gl.compile_shader(shader);
-                if !gl.get_shader_compile_status(shader) {
-                    let log = gl.get_shader_info_log(shader);
-                    tracing::warn!("video shader didn't compile: {log}");
-                    return Err(log);
-                }
-                gl.attach_shader(program, shader);
-                shaders.push(shader);
-            }
-            gl.link_program(program);
-            for shader in shaders {
-                gl.detach_shader(program, shader);
-                gl.delete_shader(shader);
-            }
-            if !gl.get_program_link_status(program) {
-                let log = gl.get_program_info_log(program);
-                tracing::warn!("video shader didn't link: {log}");
-                return Err(log);
-            }
-            gl.use_program(Some(program));
-            for (unit, name) in ["y_plane", "u_plane", "v_plane"].into_iter().enumerate() {
-                gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit as i32);
-            }
-            let textures = [gl.create_texture()?, gl.create_texture()?, gl.create_texture()?];
-            for texture in textures {
-                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                for (parameter, value) in [
-                    (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
-                    (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
-                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
-                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
-                ] {
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, value as i32);
-                }
-            }
-            Ok(Self { program, vertex_array: gl.create_vertex_array()?, textures, size: None })
-        }
     }
 }
 
