@@ -380,7 +380,7 @@ mod tests {
             fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
                 self.app.ui(ui);
             }
-            fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+            fn on_exit(&mut self) {
                 if let Some(client) = &self.app.client {
                     client.handle.disconnect();
                 }

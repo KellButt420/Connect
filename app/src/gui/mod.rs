@@ -55,16 +55,11 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         Some(key) => Some(runtime.block_on(net::bind_endpoint(key))?),
         None => None,
     };
-    // wgpu (Direct3D 12 / Vulkan / Metal) normally; plain OpenGL for machines where that fails,
-    // such as old GPUs and some VMs.
-    let renderer = match std::env::var("CONNECT_RENDERER").as_deref() {
-        Ok("glow" | "opengl") => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
-    };
     // Where hardware decoding is wanted and the graphics card decodes through Vulkan, the window
     // renders with the decoder's own device, so decoded pictures go straight to the screen.
-    let shared_gpu = (renderer == eframe::Renderer::Wgpu
-        && Settings::saved().hardware_decoding
+    // Otherwise wgpu picks a device itself: Vulkan, or Direct3D 12 (Windows) or OpenGL where
+    // Vulkan is missing.
+    let shared_gpu = (Settings::saved().hardware_decoding
         && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
     .then(|| match connect_client::SharedGpu::open() {
         Ok(gpu) => Some(gpu),
@@ -91,9 +86,10 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
             .with_title("Connect")
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0]),
-        renderer,
         // One frame queued for the screen, not two: a refresh less of delay.
         wgpu_options,
+        // Fonts for characters Inter lacks are looked up lazily instead (see `theme`).
+        system_font_fallback: false,
         ..Default::default()
     };
     let handle = runtime.handle().clone();
@@ -185,7 +181,7 @@ impl eframe::App for Root {
     }
 
     /// The window is closing: end sessions so nothing is left held down or hanging.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if let Screen::Main(app) = &mut self.screen {
             app.shutdown(&self.runtime);
         }

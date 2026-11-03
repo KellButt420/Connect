@@ -30,7 +30,7 @@ memchr = "2.7.4"
 rustc-hash = "2.1.1"
 thiserror = "1.0.59"
 tracing = "0.1.40"
-wgpu = { version = "30.0.1", optional = true }
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "vulkan"] }
 
 # Platforms that support vulkan are: windows and all non-apple unixes. emscripten is a web-based platform, where vulkan is not available either
 [target.'cfg(any(windows, all(unix, not(target_os = "emscripten"), not(target_os = "ios"), not(target_os = "macos"))))'.dependencies]

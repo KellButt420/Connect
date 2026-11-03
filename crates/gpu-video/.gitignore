@@ -2,6 +2,8 @@
 Cargo.lock
 *.h264
 *.h265
+# Connect: the H.265 parser tests and `connect gpu-check` build these in.
+!/tests/h265/*.h265
 *.jpeg
 *.mp4
 *.nv12

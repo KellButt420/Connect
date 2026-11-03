@@ -72,7 +72,7 @@ Measured causes of stutter in 0.3.0, and what changed:
   decode 5.8 ms, a fresh 15 MB RGBA buffer 6.4 ms, YUV to RGBA 1.1 ms, and egui's RGBA to
   `Color32` conversion on the GUI thread 9.0 ms. That is more than a 144 Hz frame (6.9 ms), so the
   four-frame decode queue filled and video skipped to a keyframe. Now frame buffers are reused,
-  colour conversion runs in a shader (wgpu or OpenGL), the upload is a third of the size, and a
+  colour conversion runs in a shader (through wgpu), the upload is a third of the size, and a
   decoder that falls briefly behind decodes every frame but only shows the newest.
 - **The software encoder dropped frames in motion.** With rate-control frame skipping on,
   OpenH264 skipped 56 of 60 frames of busy 1440p content at 35 Mb/s. Skipping is off; when the

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eframe::egui::epaint::text::FontProvider as _;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Frame, Galley,
     InnerResponse, Layout, Margin, Mesh, Painter, Pos2, Rect, Response, RichText, Role, Sense, Shadow, Shape, Stroke,
@@ -138,6 +139,13 @@ fn install_fonts(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), family("inter-semibold"));
     fonts.families.insert(FontFamily::Name(ICONS.into()), family("phosphor"));
     ctx.set_fonts(fonts);
+    // Characters none of those have (Chinese or Arabic in a computer's name, say) come from the
+    // system's fonts. Listing those takes memory, so it waits for the first such character
+    // rather than happening at start-up as eframe would.
+    let system = std::sync::OnceLock::new();
+    ctx.add_font_provider(Arc::new(move |request: &egui::epaint::text::FallbackRequest<'_>| {
+        system.get_or_init(egui_system_font_provider::SystemFontProvider::new).font_for(request)
+    }));
 }
 
 /// Deep blue-black with three large soft glows of colour, for the glass to sit on.
