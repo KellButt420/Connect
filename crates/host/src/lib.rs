@@ -15,6 +15,7 @@ mod gpu;
 mod input;
 mod rate;
 mod session;
+mod trace;
 mod yuv;
 
 use std::{

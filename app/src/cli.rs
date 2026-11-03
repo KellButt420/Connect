@@ -17,8 +17,10 @@ use crate::{device_name, stats_line};
 pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     let mut video = VideoSource::default();
     let mut input = InputSink::default();
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--trace" => trace_into(args.next().context("--trace needs a directory")?)?,
             "--test-pattern" => video = VideoSource::TEST_PATTERN,
             // e.g. --test-pattern=1920x1080@144
             spec if spec.starts_with("--test-pattern=") => video = test_pattern(&spec["--test-pattern=".len()..])?,
@@ -91,6 +93,17 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Writes each session's performance trace into `dir` as CSV when it ends, tracing being on.
+fn trace_into(dir: &str) -> Result<()> {
+    let dir = std::path::PathBuf::from(dir);
+    if !connect_perf::set_trace_dir(dir.clone()) && connect_perf::trace_dir().as_ref() != Some(&dir) {
+        bail!("CONNECT_TRACE already names another trace directory");
+    }
+    connect_perf::set_enabled(true);
+    println!("Performance traces go to {}", dir.display());
+    Ok(())
+}
+
 fn test_pattern(spec: &str) -> Result<VideoSource> {
     let parse = || -> Option<VideoSource> {
         let (size, fps) = spec.split_once('@')?;
@@ -112,11 +125,12 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = Some(args.next().context("--seconds needs a number")?.parse::<u64>()?),
+            "--trace" => trace_into(args.next().context("--trace needs a directory")?)?,
             part => id_parts.push(part),
         }
     }
     if id_parts.is_empty() {
-        bail!("usage: connect join <USER-ID> [--seconds N]");
+        bail!("usage: connect join <USER-ID> [--seconds N] [--trace DIR]");
     }
     let id = net::parse_user_id(&id_parts.concat())?;
 

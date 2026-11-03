@@ -22,6 +22,8 @@ pub enum Hotkey {
     Stats,
     /// Ctrl+Alt+M
     MouseCapture,
+    /// Ctrl+Alt+E: save the performance trace.
+    ExportTrace,
 }
 
 #[derive(Default)]
@@ -175,6 +177,7 @@ fn hotkey_of(key: Key) -> Option<Hotkey> {
         Key::F => Some(Hotkey::Fullscreen),
         Key::S => Some(Hotkey::Stats),
         Key::M => Some(Hotkey::MouseCapture),
+        Key::E => Some(Hotkey::ExportTrace),
         _ => None,
     }
 }

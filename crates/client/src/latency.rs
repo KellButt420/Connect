@@ -7,22 +7,34 @@
 
 use std::time::Instant;
 
-use connect_proto::{now_micros, video::FrameMeta};
+use connect_proto::{
+    micros_at,
+    video::{Arrival, FrameMeta},
+};
 
 /// One frame's timeline. Travels with the decoded picture to the window and back.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameTiming {
     pub(crate) meta: FrameMeta,
-    pub(crate) first_seen: Option<Instant>,
+    pub(crate) arrival: Option<Arrival>,
+    /// Encoded size.
+    pub(crate) bytes: u32,
+    /// Decoded on the graphics card.
+    pub(crate) hardware: bool,
     pub(crate) decode_started: Option<Instant>,
     pub(crate) decoded: Option<Instant>,
     pub(crate) painted: Option<Instant>,
+    /// Windows' performance counter at `painted`, for joining with PresentMon; 0 elsewhere.
+    pub(crate) painted_qpc: u64,
 }
 
 impl FrameTiming {
     /// Call when the picture is drawn into the window.
     pub fn mark_painted(&mut self) {
-        self.painted.get_or_insert_with(Instant::now);
+        if self.painted.is_none() {
+            self.painted = Some(Instant::now());
+            self.painted_qpc = connect_perf::qpc_now();
+        }
     }
 }
 
@@ -71,7 +83,7 @@ impl LatencyWindow {
     /// Adds a frame that has been drawn. `offset_us` is this clock minus the host's, once known.
     pub fn add(&mut self, timing: &FrameTiming, offset_us: Option<i64>) {
         let (Some(first_seen), Some(started), Some(decoded), Some(painted)) =
-            (timing.first_seen, timing.decode_started, timing.decoded, timing.painted)
+            (timing.arrival.map(|a| a.first_seen), timing.decode_started, timing.decoded, timing.painted)
         else {
             return;
         };
@@ -91,7 +103,7 @@ impl LatencyWindow {
         self.render += render;
         if let Some(offset) = offset_us {
             // The first packet's arrival on this clock, then on the host's.
-            let arrived = now_micros() as i64 - first_seen.elapsed().as_micros() as i64;
+            let arrived = micros_at(first_seen) as i64;
             let sent = (meta.capture_time_us + u64::from(meta.sent_after_us)) as i64;
             let network = ((arrived - offset - sent).max(0) as f64) / 1000.0;
             self.network.0 += network;
@@ -134,6 +146,8 @@ impl LatencyWindow {
 mod tests {
     use std::time::Duration;
 
+    use connect_proto::now_micros;
+
     use super::*;
 
     #[test]
@@ -150,10 +164,19 @@ mod tests {
                 capture_time_us: now_micros() - 30_000,
                 ..Default::default()
             },
-            first_seen: Some(at(20)),
+            arrival: Some(Arrival {
+                first_seen: at(20),
+                completed: at(19),
+                released: at(19),
+                rebuild_us: 0,
+                data_chunks: 1,
+                recovery_chunks: 1,
+                rebuilt_chunks: 0,
+            }),
             decode_started: Some(at(18)),
             decoded: Some(at(16)),
             painted: Some(at(10)),
+            ..Default::default()
         };
         let mut window = LatencyWindow::default();
         window.add(&timing, Some(0));

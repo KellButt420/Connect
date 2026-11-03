@@ -869,12 +869,13 @@ dependencies = [
 
 [[package]]
 name = "connect"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "connect-client",
  "connect-host",
  "connect-net",
+ "connect-perf",
  "connect-proto",
  "eframe",
  "egui_system_font_provider",
@@ -896,11 +897,12 @@ dependencies = [
 
 [[package]]
 name = "connect-client"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "connect-gpu-load",
  "connect-net",
+ "connect-perf",
  "connect-proto",
  "cpal",
  "gpu-video",
@@ -914,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "connect-gpu-load"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "serde",
  "windows",
@@ -922,13 +924,14 @@ dependencies = [
 
 [[package]]
 name = "connect-host"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "bytes",
  "connect-client",
  "connect-gpu-load",
  "connect-net",
+ "connect-perf",
  "connect-proto",
  "cpal",
  "iroh",
@@ -943,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "connect-net"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "connect-proto",
@@ -956,12 +959,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-perf"
+version = "0.8.2"
+dependencies = [
+ "serde",
+ "windows",
+]
+
+[[package]]
 name = "connect-proto"
-version = "0.7.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "bytes",
  "connect-gpu-load",
+ "connect-perf",
  "postcard",
  "reed-solomon-simd",
  "serde",

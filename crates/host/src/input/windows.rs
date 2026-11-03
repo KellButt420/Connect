@@ -55,6 +55,7 @@ use windows::{
 };
 
 use super::{GAMEPAD_DRIVER_URL, Held, Unavailable};
+use crate::trace::{HostTrace, InputOutcome, InputStamp};
 
 const XBUTTON1: u32 = 1;
 const XBUTTON2: u32 = 2;
@@ -135,7 +136,11 @@ fn run_elevated(exe: &Path, args: &str) -> Result<u32, String> {
 }
 
 /// Applies events until the session's sender is dropped, then unplugs its gamepads.
-pub(super) fn run(events: Receiver<InputEvent>, unavailable: UnboundedSender<Unavailable>) {
+pub(super) fn run(
+    events: Receiver<(InputEvent, Option<InputStamp>)>,
+    unavailable: UnboundedSender<Unavailable>,
+    trace: Arc<HostTrace>,
+) {
     let local = LocalInput::start();
     let mut gamepads = Gamepads::default();
     let mut held = Held::default();
@@ -168,26 +173,40 @@ pub(super) fn run(events: Receiver<InputEvent>, unavailable: UnboundedSender<Una
             host_using[i] = using;
         }
 
-        let Some(event) = event else { continue };
-        match event {
-            InputEvent::Gamepad { pad, state } => {
-                if let Err(reason) = gamepads.update(pad, state) {
+        let Some((event, stamp)) = event else { continue };
+        let outcome = match event {
+            InputEvent::Gamepad { pad, state } => match gamepads.update(pad, state) {
+                Ok(()) => InputOutcome::Injected,
+                Err(reason) => {
                     let _ = unavailable.send(Unavailable { device: DeviceClass::Gamepad, reason });
+                    InputOutcome::Refused
                 }
+            },
+            InputEvent::GamepadRemoved { pad } => {
+                gamepads.remove(pad);
+                InputOutcome::Injected
             }
-            InputEvent::GamepadRemoved { pad } => gamepads.remove(pad),
             other => {
                 let host_has_it = local.as_ref().is_some_and(|l| l.recently_used(other.device()));
                 if host_has_it && !is_release(&other) {
-                    continue;
-                }
-                held.note(&other);
-                if !send(other) && !blocked_reported {
-                    // Typically the foreground window belongs to an elevated program.
-                    debug!("Windows blocked injected input");
-                    blocked_reported = true;
+                    InputOutcome::HostPriority
+                } else {
+                    held.note(&other);
+                    if send(other) {
+                        InputOutcome::Injected
+                    } else {
+                        if !blocked_reported {
+                            // Typically the foreground window belongs to an elevated program.
+                            debug!("Windows blocked injected input");
+                            blocked_reported = true;
+                        }
+                        InputOutcome::Refused
+                    }
                 }
             }
+        };
+        if let Some(stamp) = stamp {
+            trace.inputs.push(stamp.record(event.kind(), outcome));
         }
     }
 }

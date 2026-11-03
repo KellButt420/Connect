@@ -3,6 +3,9 @@
 //! hardware encoder on the same device to read; nothing crosses to system memory.
 //!
 //! Colours match the processor path in `yuv`: BT.601, limited range, which the viewer expects.
+//!
+//! Each conversion's run time on the graphics card is measured with timestamp queries, read back
+//! a few frames later without waiting, for the performance trace.
 
 use std::mem::ManuallyDrop;
 
@@ -10,15 +13,17 @@ use anyhow::{Context, Result, ensure};
 use windows::{
     Win32::Graphics::{
         Direct3D11::{
-            D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-            D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
-            D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
-            D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
-            D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext,
-            ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+            D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+            D3D11_MAPPED_SUBRESOURCE, D3D11_QUERY, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC,
+            D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+            D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+            D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
+            D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
+            ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
             ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
         },
         Dxgi::Common::{
@@ -29,7 +34,10 @@ use windows::{
     core::Interface,
 };
 
-use crate::yuv::{Layout, Picture};
+use crate::{
+    trace::TimerVerdict,
+    yuv::{Layout, Picture},
+};
 
 pub(crate) struct Nv12Converter {
     device: ID3D11Device,
@@ -44,6 +52,8 @@ pub(crate) struct Nv12Converter {
     input: Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
     /// For reading the picture back, made when first needed.
     staging: Option<ID3D11Texture2D>,
+    /// `None` where the device can't time its work.
+    timer: Option<GpuTimer>,
     width: u32,
     height: u32,
 }
@@ -136,6 +146,7 @@ impl Nv12Converter {
                 output: output.context("no output view")?,
                 input: None,
                 staging: None,
+                timer: GpuTimer::new(device),
                 width,
                 height,
             })
@@ -156,8 +167,9 @@ impl Nv12Converter {
     }
 
     /// Converts `bgra`, a capture at least this converter's size (an odd last row or column
-    /// is left out), into [`Self::texture`].
-    pub fn convert(&mut self, bgra: &ID3D11Texture2D) -> Result<()> {
+    /// is left out), into [`Self::texture`]. With a `tag`, the conversion is timed on the
+    /// graphics card while tracing is on; [`Self::poll_timings`] gives the result later.
+    pub fn convert(&mut self, bgra: &ID3D11Texture2D, tag: Option<u64>) -> Result<()> {
         unsafe {
             if self.input.as_ref().is_none_or(|(texture, _)| texture != bgra) {
                 let view = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -188,9 +200,27 @@ impl Nv12Converter {
                 ..Default::default()
             };
             let mut streams = [stream];
+            let timing = match (&mut self.timer, tag) {
+                (Some(timer), Some(tag)) if connect_perf::enabled() => timer.begin(&self.context).map(|at| (at, tag)),
+                _ => None,
+            };
             let result = self.video_context.VideoProcessorBlt(&self.processor, &self.output, 0, &streams);
+            if let (Some(timer), Some((at, tag))) = (&mut self.timer, timing) {
+                timer.end(&self.context, at, tag);
+            }
             ManuallyDrop::drop(&mut streams[0].pInputSurface);
             result.context("converting the capture to NV12")
+        }
+    }
+
+    /// Conversions the graphics card has finished timing since the last call, oldest first: their
+    /// tags and run times in µs. Never waits for the card.
+    pub fn poll_timings(&mut self, out: impl FnMut(u64, u32)) {
+        if let Some(timer) = &mut self.timer
+            && !timer.poll(&self.context, out)
+        {
+            tracing::info!("this driver's GPU timestamps don't cover the colour conversion; not timing it");
+            self.timer = None;
         }
     }
 
@@ -222,4 +252,119 @@ impl Nv12Converter {
             Ok(picture)
         }
     }
+}
+
+/// Conversions timed at once. Results come back a frame or two later; one whose slot is still
+/// waiting when its turn comes round again goes untimed rather than wait.
+const TIMER_SLOTS: usize = 4;
+
+/// Times work on the graphics card: a timestamp before and after, inside a disjoint query that
+/// says whether the counter's frequency held steady in between.
+struct GpuTimer {
+    slots: Vec<TimerSlot>,
+    check: crate::trace::TimerCheck,
+    /// The slot the next timing uses; the oldest in flight.
+    next: usize,
+}
+
+struct TimerSlot {
+    disjoint: ID3D11Query,
+    start: ID3D11Query,
+    end: ID3D11Query,
+    /// Set while the slot's queries are on the card.
+    tag: Option<u64>,
+}
+
+impl GpuTimer {
+    fn new(device: &ID3D11Device) -> Option<Self> {
+        let query = |kind: D3D11_QUERY| {
+            let mut query = None;
+            // SAFETY: a valid description, and somewhere for the query to go.
+            unsafe { device.CreateQuery(&D3D11_QUERY_DESC { Query: kind, MiscFlags: 0 }, Some(&mut query)) }.ok()?;
+            query
+        };
+        let slot = || {
+            Some(TimerSlot {
+                disjoint: query(D3D11_QUERY_TIMESTAMP_DISJOINT)?,
+                start: query(D3D11_QUERY_TIMESTAMP)?,
+                end: query(D3D11_QUERY_TIMESTAMP)?,
+                tag: None,
+            })
+        };
+        Some(Self {
+            slots: (0..TIMER_SLOTS).map(|_| slot()).collect::<Option<_>>()?,
+            next: 0,
+            check: Default::default(),
+        })
+    }
+
+    /// Marks the start; `None` (untimed) if the slot is still waiting for an earlier result.
+    unsafe fn begin(&mut self, context: &ID3D11DeviceContext) -> Option<usize> {
+        let at = self.next;
+        let slot = &self.slots[at];
+        if slot.tag.is_some() {
+            return None;
+        }
+        unsafe {
+            context.Begin(&slot.disjoint);
+            context.End(&slot.start);
+        }
+        Some(at)
+    }
+
+    unsafe fn end(&mut self, context: &ID3D11DeviceContext, at: usize, tag: u64) {
+        let slot = &mut self.slots[at];
+        unsafe {
+            context.End(&slot.end);
+            context.End(&slot.disjoint);
+        }
+        slot.tag = Some(tag);
+        self.next = (at + 1) % self.slots.len();
+    }
+
+    /// Hands over the timings that are ready. False once the timings have proved meaningless
+    /// (see [`crate::trace::TimerCheck`]), so the timer should be dropped.
+    fn poll(&mut self, context: &ID3D11DeviceContext, mut out: impl FnMut(u64, u32)) -> bool {
+        let count = self.slots.len();
+        for i in 0..count {
+            let slot = &mut self.slots[(self.next + i) % count];
+            let Some(tag) = slot.tag else { continue };
+            // SAFETY: each query is read into the type its kind returns.
+            let Some(disjoint) = (unsafe { ready::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(context, &slot.disjoint) })
+            else {
+                break; // later slots finish later
+            };
+            let (start, end) = unsafe { (ready::<u64>(context, &slot.start), ready::<u64>(context, &slot.end)) };
+            let (Some(start), Some(end)) = (start, end) else { break };
+            slot.tag = None;
+            if disjoint.Disjoint.as_bool() || disjoint.Frequency == 0 || end < start {
+                continue;
+            }
+            match self.check.check(end - start, disjoint.Frequency) {
+                TimerVerdict::Keep => {
+                    let us = u128::from(end - start) * 1_000_000 / u128::from(disjoint.Frequency);
+                    out(tag, us.min(u128::from(u32::MAX)) as u32);
+                }
+                TimerVerdict::Skip => {}
+                TimerVerdict::GiveUp => return false,
+            }
+        }
+        true
+    }
+}
+
+/// A query's result if the card has it, without waiting or flushing. (The wrapper's `GetData`
+/// folds "not ready yet", `S_FALSE`, into success, so this calls the method directly.)
+unsafe fn ready<T: Default>(context: &ID3D11DeviceContext, query: &ID3D11Query) -> Option<T> {
+    let mut value = T::default();
+    let result = unsafe {
+        (Interface::vtable(context).GetData)(
+            Interface::as_raw(context),
+            query.as_raw(),
+            (&raw mut value).cast(),
+            size_of::<T>() as u32,
+            D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+        )
+    };
+    (result == windows::Win32::Foundation::S_OK).then_some(value)
 }

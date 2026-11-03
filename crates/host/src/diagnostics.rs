@@ -83,7 +83,7 @@ mod windows {
 
         // Colour conversion on the GPU, against the processor's conversion of the same image.
         let mut converter = Nv12Converter::new(&device, w, h).context("GPU colour conversion (video processor)")?;
-        converter.convert(capturer.latest())?;
+        converter.convert(capturer.latest(), None)?;
         let on_gpu = converter.read_back()?;
         let frame = capturer.read_latest()?.context("no image to compare")?;
         let mut on_cpu = Picture::new(Layout::Nv12, w as usize, h as usize);
@@ -111,7 +111,7 @@ mod windows {
             if let Some(size) = capturer.next_texture(Duration::from_millis(4))?
                 && (size.0 & !1, size.1 & !1) == (w, h)
             {
-                converter.convert(capturer.latest())?;
+                converter.convert(capturer.latest(), None)?;
                 fresh += 1;
             }
             let encode_started = Instant::now();
