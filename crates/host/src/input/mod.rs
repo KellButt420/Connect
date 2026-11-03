@@ -5,17 +5,19 @@
 #[cfg(windows)]
 mod windows;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 use connect_net as net;
 use connect_proto::{
     DeviceClass, Permissions,
-    input::{GamepadState, InputEvent, MAX_MOUSE_STEP, MouseButton},
+    input::{GamepadState, InputEvent, MAX_MOUSE_STEP, MouseButton, TimedInput},
 };
 use iroh::endpoint::{Connection, RecvStream};
 use tokio::sync::{mpsc, watch};
 use tracing::debug;
+
+use crate::trace::{HostTrace, InputOutcome, InputStamp};
 
 /// Where allowed input goes.
 #[derive(Debug, Clone, Default)]
@@ -60,6 +62,7 @@ pub(crate) async fn serve(
     mut permissions: watch::Receiver<Permissions>,
     sink: InputSink,
     unavailable: mpsc::UnboundedSender<Unavailable>,
+    trace: Arc<HostTrace>,
 ) {
     let recv = match conn.accept_uni().await {
         Ok(recv) => recv,
@@ -69,38 +72,42 @@ pub(crate) async fn serve(
     let (event_tx, mut events) = mpsc::channel(256);
     tokio::spawn(read_loop(recv, event_tx));
 
-    let mut output = Output::open(sink, unavailable);
+    let mut output = Output::open(sink, unavailable, trace.clone());
     let mut held = Held::default();
     loop {
         tokio::select! {
-            event = events.recv() => {
-                let Some(event) = event else { break };
+            input = events.recv() => {
+                let Some((TimedInput { seq, client_time_us, event }, received_us)) = input else { break };
+                let stamp = InputStamp { seq, client_time_us, received_us };
                 if !event.is_valid() {
                     debug!(?event, "ignoring malformed input");
                 } else if permissions.borrow().allows(event.device()) {
                     let event = clamp(event);
                     held.note(&event);
-                    output.send(event);
+                    output.send(event, Some(stamp));
+                } else {
+                    trace.inputs.push(stamp.record(event.kind(), InputOutcome::NotAllowed));
                 }
             }
             Ok(()) = permissions.changed() => {
                 let now = *permissions.borrow_and_update();
                 for event in held.release_revoked(now) {
-                    output.send(event);
+                    output.send(event, None);
                 }
             }
         }
     }
     for event in held.release_all() {
-        output.send(event);
+        output.send(event, None);
     }
 }
 
-async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<InputEvent>) {
+/// Reads input events, noting when each arrived.
+async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<(TimedInput, u64)>) {
     loop {
-        match net::read_msg::<InputEvent>(&mut recv).await {
-            Ok(Some(event)) => {
-                if tx.send(event).await.is_err() {
+        match net::read_msg::<TimedInput>(&mut recv).await {
+            Ok(Some(input)) => {
+                if tx.send((input, connect_proto::now_micros())).await.is_err() {
                     return;
                 }
             }
@@ -122,19 +129,26 @@ fn clamp(event: InputEvent) -> InputEvent {
 
 /// Hands events to the sink. For [`InputSink::System`] that's a dedicated thread, so a slow
 /// driver call never holds up the network. Dropping it waits for that thread to apply what was
-/// sent and unplug its gamepads.
+/// sent and unplug its gamepads. Events from the viewer carry their stamp, for the trace;
+/// releases the host makes up don't.
 struct Output {
-    send: Option<Box<dyn Fn(InputEvent) + Send>>,
+    send: Option<Sink>,
     #[cfg(windows)]
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Takes an event, and its stamp if it came from the viewer.
+type Sink = Box<dyn Fn(InputEvent, Option<InputStamp>) + Send>;
+
 impl Output {
-    fn open(sink: InputSink, unavailable: mpsc::UnboundedSender<Unavailable>) -> Self {
+    fn open(sink: InputSink, unavailable: mpsc::UnboundedSender<Unavailable>, trace: Arc<HostTrace>) -> Self {
         match sink {
             InputSink::Channel(tx) => Output {
-                send: Some(Box::new(move |event| {
+                send: Some(Box::new(move |event, stamp: Option<InputStamp>| {
                     let _ = tx.send(event);
+                    if let Some(stamp) = stamp {
+                        trace.inputs.push(stamp.record(event.kind(), InputOutcome::Channel));
+                    }
                 })),
                 #[cfg(windows)]
                 thread: None,
@@ -145,25 +159,25 @@ impl Output {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let thread = std::thread::Builder::new()
                     .name("connect-input".into())
-                    .spawn(move || windows::run(rx, unavailable))
+                    .spawn(move || windows::run(rx, unavailable, trace))
                     .map_err(|e| tracing::warn!("couldn't start the input thread: {e}"))
                     .ok();
-                let send: Box<dyn Fn(InputEvent) + Send> = Box::new(move |event| {
-                    let _ = tx.send(event);
+                let send: Sink = Box::new(move |event, stamp| {
+                    let _ = tx.send((event, stamp));
                 });
                 Output { send: thread.as_ref().map(|_| send), thread }
             }
             #[cfg(not(windows))]
             InputSink::System => {
-                drop(unavailable);
+                drop((unavailable, trace));
                 Output { send: None }
             }
         }
     }
 
-    fn send(&mut self, event: InputEvent) {
+    fn send(&mut self, event: InputEvent, stamp: Option<InputStamp>) {
         if let Some(send) = &self.send {
-            send(event);
+            send(event, stamp);
         }
     }
 }

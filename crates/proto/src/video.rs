@@ -70,8 +70,26 @@ pub struct FrameMeta {
 pub struct EncodedFrame {
     pub meta: FrameMeta,
     pub data: Bytes,
-    /// On the viewer: when the frame's first datagram arrived.
-    pub first_seen: Option<Instant>,
+    /// On the viewer: how the frame arrived.
+    pub arrival: Option<Arrival>,
+}
+
+/// How a frame came together on the viewer, on the viewer's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrival {
+    /// The frame's first datagram arrived.
+    pub first_seen: Instant,
+    /// Enough chunks were in, and the frame was rebuilt from them.
+    pub completed: Instant,
+    /// The [`FrameAssembler`] handed it on: as soon as it completed, or once an earlier frame
+    /// it waited for came in or was given up on.
+    pub released: Instant,
+    /// Putting the frame together from its chunks, Reed-Solomon recovery included.
+    pub rebuild_us: u32,
+    pub data_chunks: u16,
+    pub recovery_chunks: u16,
+    /// Data chunks that never arrived and were rebuilt from recovery chunks.
+    pub rebuilt_chunks: u16,
 }
 
 /// Recovery chunks for a frame of `data_count` chunks on a path losing `loss` (0..1) of its
@@ -233,6 +251,7 @@ impl Partial {
     /// The whole frame, rebuilding missing data chunks from recovery chunks if need be. Only
     /// called once `data_count` chunks are in.
     fn rebuild(self) -> Result<(EncodedFrame, bool)> {
+        let started = Instant::now();
         let (data, recovery) = self.chunks.split_at(self.data_count);
         let missing = data.iter().filter(|c| c.is_none()).count();
         let mut frame = BytesMut::with_capacity(self.frame_len);
@@ -268,7 +287,17 @@ impl Partial {
             }
             frame.truncate(self.frame_len);
         }
-        Ok((EncodedFrame { meta: self.meta, data: frame.freeze(), first_seen: Some(self.first_seen) }, missing > 0))
+        let completed = Instant::now();
+        let arrival = Arrival {
+            first_seen: self.first_seen,
+            completed,
+            released: completed,
+            rebuild_us: completed.duration_since(started).as_micros().min(u32::MAX as u128) as u32,
+            data_chunks: self.data_count as u16,
+            recovery_chunks: recovery.len() as u16,
+            rebuilt_chunks: missing as u16,
+        };
+        Ok((EncodedFrame { meta: self.meta, data: frame.freeze(), arrival: Some(arrival) }, missing > 0))
     }
 }
 
@@ -433,7 +462,10 @@ impl FrameAssembler {
         let mut seq = frame.meta.seq;
         self.stats.frames_completed += 1;
         self.ready.push_back(frame);
-        while let Some(frame) = self.held.remove(&(seq + 1)) {
+        while let Some(mut frame) = self.held.remove(&(seq + 1)) {
+            if let Some(arrival) = &mut frame.arrival {
+                arrival.released = Instant::now();
+            }
             seq += 1;
             self.stats.frames_completed += 1;
             self.ready.push_back(frame);
@@ -515,6 +547,30 @@ mod tests {
             assert_eq!(&out[0].data[..], &data[..]);
             assert_eq!(asm.stats.frames_recovered, 1);
         }
+    }
+
+    #[test]
+    fn arrival_records_chunks_rebuilt_and_timing_order() {
+        let (meta, data) = frame(0, true, 5000);
+        let all = packetize(meta, &data, 1200, 2).unwrap();
+        let data_count = 5000usize.div_ceil(1200 - HEADER_LEN);
+        let mut asm = FrameAssembler::new();
+        // Lose the second data chunk.
+        let out = feed(&mut asm, all.iter().enumerate().filter(|(i, _)| *i != 1).map(|(_, c)| c.clone()));
+        let arrival = out[0].arrival.expect("viewer frames carry their arrival");
+        assert_eq!((arrival.data_chunks, arrival.recovery_chunks, arrival.rebuilt_chunks), (data_count as u16, 2, 1));
+        assert!(arrival.first_seen <= arrival.completed && arrival.completed <= arrival.released);
+
+        // A frame completing before the one ahead of it is released only when that one is.
+        let mut later = chunks(2, false, 3000, 0);
+        let earlier = chunks(1, false, 3000, 0);
+        assert!(feed(&mut asm, later.drain(..)).is_empty(), "held for frame 1");
+        std::thread::sleep(Duration::from_millis(2));
+        let out = feed(&mut asm, earlier);
+        assert_eq!(seqs(&out), [1, 2]);
+        let held = out[1].arrival.unwrap();
+        assert!(held.released.duration_since(held.completed) >= Duration::from_millis(2), "{held:?}");
+        assert_eq!(held.rebuilt_chunks, 0);
     }
 
     #[test]

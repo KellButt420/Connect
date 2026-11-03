@@ -72,6 +72,8 @@ pub enum HostMsg {
         loss_permille: u16,
         /// How busy the host's graphics card is, where it can tell.
         gpu: Option<connect_gpu_load::GpuLoad>,
+        /// Where the host's time goes, unless the host has tracing off.
+        perf: Option<Box<crate::perf::HostPerf>>,
     },
 }
 

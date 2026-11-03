@@ -6,20 +6,27 @@
 //! from the [`ClientHandle`].
 
 mod audio;
+mod clock;
 mod decoder;
 pub mod diagnostics;
 mod gpu_decode;
 mod latency;
 mod pacing;
+mod trace;
 mod video;
 
+pub use clock::ClockOffset;
 pub use connect_gpu_load::GpuLoad;
+pub use connect_perf::{Percentiles, ProcessLoad, Spread};
+pub use connect_proto::perf::HostPerf;
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
 pub use gpu_decode::SharedGpu;
 pub use latency::{FrameTiming, Latency};
+pub use trace::FrameStats;
 
 use std::{
     fmt,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
@@ -33,7 +40,7 @@ use connect_proto::{
     CLOSE_NORMAL, CLOSE_REJECTED, Codec, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
     cursor::{CursorPosition, CursorShape},
-    input::InputEvent,
+    input::{InputEvent, TimedInput},
     now_micros,
     video::FrameMeta,
 };
@@ -42,7 +49,7 @@ use iroh::{
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
 };
 use tokio::sync::{Notify, mpsc};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Whether new sessions try to decode video on the graphics card; see [`set_hardware_decoding`].
 static HARDWARE_DECODING: AtomicBool = AtomicBool::new(true);
@@ -209,6 +216,10 @@ pub struct Stats {
     pub frames_recovered: u64,
     /// Frames decoded but replaced by a newer one before they could be shown.
     pub frames_superseded: u64,
+    /// Complete frames thrown away because one they depended on was lost.
+    pub frames_skipped: u64,
+    /// Frames lost, skipped or superseded during the last stats window.
+    pub dropped: u64,
     /// The bitrate the host is aiming for, fitted to the connection; at most its cap.
     pub host_mbps: Option<f32>,
     /// Share of packets the host sees going missing, 0..1.
@@ -225,6 +236,26 @@ pub struct Stats {
     /// How busy each PC's graphics card is, where it can tell.
     pub host_gpu: Option<GpuLoad>,
     pub gpu: Option<GpuLoad>,
+    /// Percentiles over the last stats window, from the performance trace; `None` with tracing
+    /// off or before a frame was decoded.
+    pub frames: Option<FrameStats>,
+    /// The host's own figures, as it last reported them.
+    pub host_perf: Option<HostPerf>,
+    /// This app's CPU and memory use.
+    pub process: Option<ProcessLoad>,
+    /// The estimated offset between the two PCs' clocks, which `network`, `total` and the input
+    /// figures go through.
+    pub clock: Option<ClockOffset>,
+    /// Trace records this side dropped because a reader had the buffer at that moment.
+    pub trace_dropped: u64,
+}
+
+impl Stats {
+    /// Remote input from leaving here to arriving at the host, µs: the host's measurement
+    /// across the two clocks, corrected by the clock offset. An estimate.
+    pub fn input_one_way(&self) -> Option<Percentiles> {
+        Some(self.host_perf?.input_transit_raw?.shifted(self.clock?.offset_us))
+    }
 }
 
 impl Default for Stats {
@@ -237,6 +268,8 @@ impl Default for Stats {
             frames_lost: 0,
             frames_recovered: 0,
             frames_superseded: 0,
+            frames_skipped: 0,
+            dropped: 0,
             host_mbps: None,
             loss: None,
             encode_ms: 0.0,
@@ -246,6 +279,11 @@ impl Default for Stats {
             latency: None,
             host_gpu: None,
             gpu: None,
+            frames: None,
+            host_perf: None,
+            process: None,
+            clock: None,
+            trace_dropped: 0,
         }
     }
 }
@@ -260,7 +298,7 @@ struct Shared {
     disconnected: AtomicBool,
     conn: Mutex<Option<Connection>>,
     /// Feeds the input stream while a session runs.
-    input: Mutex<Option<mpsc::UnboundedSender<InputEvent>>>,
+    input: Mutex<Option<mpsc::UnboundedSender<TimedInput>>>,
     frame: Mutex<pacing::Pacer>,
     /// Picture buffers the GUI is done with, for the decoder to reuse.
     spare_buffers: Mutex<Vec<Vec<u8>>>,
@@ -272,7 +310,11 @@ struct Shared {
     stats: Mutex<Stats>,
     counters: Counters,
     latency: Mutex<latency::LatencyWindow>,
+    trace: trace::ViewerTrace,
+    /// Numbers input events for the trace.
+    input_seq: AtomicU32,
     host_gpu: Mutex<Option<GpuLoad>>,
+    host_perf: Mutex<Option<HostPerf>>,
     cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
     cursor_sequence: AtomicU64,
     playback: Mutex<Option<Arc<audio::Playback>>>,
@@ -295,8 +337,30 @@ struct Counters {
     loss_permille: AtomicU32,
     encode_us: AtomicU64,
     decode_us: AtomicU64,
+    frames_skipped: AtomicU64,
     /// Client clock minus host clock, µs; `i64::MIN` until measured.
     clock_offset_us: AtomicI64,
+    /// How far off that may be, µs.
+    clock_uncertainty_us: AtomicU64,
+}
+
+impl Counters {
+    /// The clock offset, once measured. (Its two halves are stored apart, so a read racing an
+    /// update may pair one estimate's offset with the next one's uncertainty: harmless here.)
+    fn clock(&self) -> Option<ClockOffset> {
+        let offset_us = self.clock_offset_us.load(Ordering::Relaxed);
+        (offset_us != i64::MIN)
+            .then(|| ClockOffset { offset_us, uncertainty_us: self.clock_uncertainty_us.load(Ordering::Relaxed) })
+    }
+}
+
+impl Shared {
+    /// Adds a decoded frame to the trace: shown if it was drawn, superseded if not.
+    fn record(&self, timing: &FrameTiming) {
+        if connect_perf::enabled() {
+            self.trace.frames.push(trace::FrameRecord::new(timing, self.counters.clock()));
+        }
+    }
 }
 
 /// Starts connecting to `host`. `wake` is called (from any thread) whenever there's a new event
@@ -320,7 +384,10 @@ pub fn connect(
         gpu_decoding: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
         latency: Mutex::new(latency::LatencyWindow::default()),
+        trace: trace::ViewerTrace::new(),
+        input_seq: AtomicU32::new(0),
         host_gpu: Mutex::new(None),
+        host_perf: Mutex::new(None),
         cursor: Mutex::new((CursorPosition::default(), None, Instant::now())),
         cursor_sequence: AtomicU64::new(0),
         playback: Mutex::new(None),
@@ -341,6 +408,14 @@ pub fn connect(
     tokio::spawn(async move {
         let reason = run(&endpoint, host, &client_name, &task_shared, &events).await;
         debug!("session ended: {reason}");
+        if let Some(dir) = connect_perf::trace_dir().filter(|_| connect_perf::enabled()) {
+            let shared = task_shared.clone();
+            match tokio::task::spawn_blocking(move || shared.trace.write(&dir, false)).await {
+                Ok(Ok(files)) => info!(files = ?files, "performance trace written"),
+                Ok(Err(error)) => warn!("couldn't write the performance trace: {error}"),
+                Err(error) => warn!("writing the performance trace stopped: {error}"),
+            }
+        }
         events.send(ClientEvent::Ended(reason)).await;
     });
     (ClientHandle(shared), events_rx)
@@ -352,6 +427,7 @@ impl ClientHandle {
         let (frame, replaced) = lock(&self.0.frame).take();
         for unseen in replaced {
             self.0.counters.frames_superseded.fetch_add(1, Ordering::Relaxed);
+            self.0.record(&unseen.timing);
             recycle(&self.0, unseen.yuv);
         }
         frame
@@ -362,11 +438,19 @@ impl ClientHandle {
         lock(&self.0.frame).next_due()
     }
 
-    /// Returns a shown frame's buffer for the decoder to reuse.
+    /// Returns a frame's buffer for the decoder to reuse, once shown (or replaced before it
+    /// could be: one never marked painted counts as superseded).
     pub fn recycle(&self, frame: VideoFrame) {
         let offset = self.0.counters.clock_offset_us.load(Ordering::Relaxed);
         lock(&self.0.latency).add(&frame.timing, (offset != i64::MIN).then_some(offset));
+        self.0.record(&frame.timing);
         recycle(&self.0, frame.yuv);
+    }
+
+    /// Writes the session's performance trace so far into `dir` as CSV files, returning them.
+    /// Blocks on file I/O, so call it off the UI thread.
+    pub fn export_trace(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        self.0.trace.write(dir, true)
     }
 
     /// What is decoding the video, e.g. "Decoder: GPU · AMD Radeon RX 7600"; empty until
@@ -408,7 +492,18 @@ impl ClientHandle {
     /// drops anything its permissions don't allow.
     pub fn send_input(&self, event: InputEvent) {
         if let Some(tx) = &*lock(&self.0.input) {
-            let _ = tx.send(event);
+            let seq = self.0.input_seq.fetch_add(1, Ordering::Relaxed);
+            let client_time_us = now_micros();
+            if connect_perf::enabled() {
+                let clock = self.0.counters.clock();
+                self.0.trace.inputs.push(trace::InputRecord {
+                    seq,
+                    kind: event.kind(),
+                    sent_us: client_time_us,
+                    clock,
+                });
+            }
+            let _ = tx.send(TimedInput { seq, client_time_us, event });
         }
     }
 
@@ -531,19 +626,16 @@ async fn stream(
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut last_keyframe_request: Option<Instant> = None;
     let mut window = StatsWindow::new(shared);
-    let mut best_rtt_us = u64::MAX;
+    let mut clock = clock::ClockSync::default();
 
     loop {
         tokio::select! {
             msg = msgs.recv() => match msg {
                 Some(Ok(HostMsg::Pong { client_time_us, host_time_us })) => {
-                    let now = now_micros();
-                    let rtt = now.saturating_sub(client_time_us);
-                    // The fastest round trip gives the tightest bound on the clock offset.
-                    if rtt <= best_rtt_us {
-                        best_rtt_us = rtt;
-                        let offset = (client_time_us + rtt / 2) as i64 - host_time_us as i64;
-                        shared.counters.clock_offset_us.store(offset, Ordering::Relaxed);
+                    if let Some(best) = clock.add(client_time_us, host_time_us, now_micros(), Instant::now()) {
+                        let c = &shared.counters;
+                        c.clock_uncertainty_us.store(best.uncertainty_us, Ordering::Relaxed);
+                        c.clock_offset_us.store(best.offset_us, Ordering::Relaxed);
                     }
                 }
                 Some(Ok(HostMsg::PermissionsChanged(p))) => {
@@ -553,8 +645,9 @@ async fn stream(
                 Some(Ok(HostMsg::VideoEncoder { name, codec })) => {
                     events.send(ClientEvent::VideoEncoder { name, codec }).await
                 }
-                Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille, gpu })) => {
+                Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille, gpu, perf })) => {
                     *lock(&shared.host_gpu) = gpu;
+                    *lock(&shared.host_perf) = perf.map(|perf| *perf);
                     shared.counters.host_kbps.store(bitrate_kbps, Ordering::Relaxed);
                     shared.counters.loss_permille.store(loss_permille.into(), Ordering::Relaxed);
                 }
@@ -579,6 +672,7 @@ async fn stream(
                 None => return Ok(None),
             },
             Some(()) = keyframe_rx.recv() => {
+                let best_rtt_us = clock.min_rtt_us().unwrap_or(u64::MAX);
                 let round_trip = Duration::from_micros(best_rtt_us.min(200_000)) + Duration::from_millis(30);
                 if last_keyframe_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_INTERVAL.max(round_trip)) {
                     last_keyframe_request = Some(Instant::now());
@@ -668,7 +762,7 @@ async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<Result<HostMsg>>) {
     }
 }
 
-async fn write_input(mut stream: SendStream, mut events: mpsc::UnboundedReceiver<InputEvent>) {
+async fn write_input(mut stream: SendStream, mut events: mpsc::UnboundedReceiver<TimedInput>) {
     while let Some(event) = events.recv().await {
         if let Err(e) = net::write_msg(&mut stream, &event).await {
             return debug!("input stream closed: {e:#}");
@@ -695,12 +789,18 @@ fn describe_close(error: &ConnectionError) -> EndReason {
     }
 }
 
-/// Turns the running counters into per-second rates.
+/// Turns the running counters into per-second rates, and the trace into percentiles.
 struct StatsWindow {
     at: Instant,
     bytes: u64,
     frames: u64,
+    /// Frames lost or skipped so far.
+    gone: u64,
     gpu: Option<connect_gpu_load::Monitor>,
+    process: connect_perf::ProcessMonitor,
+    /// Trace records up to here are summarised.
+    mark: u64,
+    last_shown: trace::LastShown,
 }
 
 impl StatsWindow {
@@ -710,7 +810,11 @@ impl StatsWindow {
             at: Instant::now(),
             bytes: c.bytes.load(Ordering::Relaxed),
             frames: c.frames_decoded.load(Ordering::Relaxed),
+            gone: c.frames_lost.load(Ordering::Relaxed) + c.frames_skipped.load(Ordering::Relaxed),
             gpu: connect_gpu_load::Monitor::new(),
+            process: connect_perf::ProcessMonitor::new(),
+            mark: shared.trace.frames.written(),
+            last_shown: None,
         }
     }
 
@@ -720,17 +824,26 @@ impl StatsWindow {
         if secs < 0.5 {
             return; // the first tick fires at once; rates need a real window
         }
-        let (bytes, frames) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
+        let (bytes, decoded) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
         let latency = lock(&shared.latency).take();
+        let frames = connect_perf::enabled().then(|| {
+            let (records, mark) = shared.trace.frames.since(self.mark);
+            self.mark = mark;
+            (!records.is_empty()).then(|| trace::summarize(&records, &mut self.last_shown))
+        });
+        let gone = c.frames_lost.load(Ordering::Relaxed) + c.frames_skipped.load(Ordering::Relaxed);
+        let superseded = frames.flatten().map_or(0, |f| u64::from(f.superseded));
         *lock(&shared.stats) = Stats {
             path,
             rtt,
-            fps: (frames - self.frames) as f32 / secs,
+            fps: (decoded - self.frames) as f32 / secs,
             mbps: (bytes - self.bytes) as f32 * 8.0 / secs / 1e6,
             frames_lost: c.frames_lost.load(Ordering::Relaxed),
             frames_recovered: c.frames_recovered.load(Ordering::Relaxed),
             frames_superseded: c.frames_superseded.load(Ordering::Relaxed),
+            frames_skipped: c.frames_skipped.load(Ordering::Relaxed),
+            dropped: gone.saturating_sub(self.gone) + superseded,
             host_mbps: match c.host_kbps.load(Ordering::Relaxed) {
                 u32::MAX => None,
                 kbps => Some(kbps as f32 / 1000.0),
@@ -744,8 +857,13 @@ impl StatsWindow {
             latency,
             host_gpu: *lock(&shared.host_gpu),
             gpu: self.gpu.as_mut().and_then(connect_gpu_load::Monitor::sample),
+            frames: frames.flatten(),
+            host_perf: *lock(&shared.host_perf),
+            process: self.process.sample(),
+            clock: c.clock(),
+            trace_dropped: shared.trace.dropped(),
         };
-        (self.at, self.bytes, self.frames) = (Instant::now(), bytes, frames);
+        (self.at, self.bytes, self.frames, self.gone) = (Instant::now(), bytes, decoded, gone);
         (shared.wake)();
     }
 }

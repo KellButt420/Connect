@@ -24,9 +24,10 @@ use crate::{
     ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
     audio::AudioStream,
     cursor::CursorStream,
-    encode::{VideoEvent, VideoStream},
+    encode::{FrameStamp, VideoEvent, VideoStream},
     input::{self, Unavailable},
     rate::{self, RateControl},
+    trace::{FrameRecord, HostTrace, Reporter},
 };
 
 /// An unchanged pointer position is sent again this often, so the viewer knows it's current.
@@ -109,8 +110,9 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
 
     let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
     let rate = RateControl::new(bitrate_bps);
-    let mut video =
-        VideoStream::start(shared.video.clone(), codec, rate.bitrate(), Box::new(rate.backlog_check(conn.clone())))?;
+    let trace = Arc::new(HostTrace::new());
+    let backlog = Box::new(rate.backlog_check(conn.clone()));
+    let mut video = VideoStream::start(shared.video.clone(), codec, rate.bitrate(), backlog, trace.clone())?;
     let (width, height) = match video.next().await {
         Some(Ok(VideoEvent::Format { width, height })) => (width, height),
         Some(Err(e)) => {
@@ -129,12 +131,17 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted }).await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
-    let input =
-        tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
+    let input = tokio::spawn(input::serve(
+        conn.clone(),
+        shared.permissions.subscribe(),
+        shared.input.clone(),
+        unavailable_tx,
+        trace.clone(),
+    ));
 
     let desktop = shared.video == VideoSource::Screen;
     let codecs = Codecs { encoders, decoders, failed: Vec::new() };
-    let result = stream(conn, send, recv, video, codecs, rate, permissions, unavailable, desktop).await;
+    let result = stream(conn, send, recv, video, codecs, rate, permissions, unavailable, desktop, &trace).await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -146,6 +153,7 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if timeout(INPUT_RELEASE, input).await.is_err() {
         warn!("input took too long to release");
     }
+    write_trace(trace).await;
     let _ = events.send(HostEvent::SessionEnded { peer, reason }).await;
     Ok(())
 }
@@ -194,6 +202,7 @@ async fn stream(
     mut permissions: watch::Receiver<Permissions>,
     mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
     desktop: bool,
+    trace: &HostTrace,
 ) -> Result<()> {
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (msg_tx, mut msgs) = mpsc::channel(16);
@@ -220,6 +229,7 @@ async fn stream(
     rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rate_ticks = 0u32;
     let mut gpu_load = connect_gpu_load::Monitor::new();
+    let mut reporter = Reporter::new();
     let mut remote_seq = None;
     let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
     let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
@@ -315,6 +325,7 @@ async fn stream(
                         bitrate_kbps: rate.bitrate() / 1000,
                         loss_permille: (rate.loss() * 1000.0).round() as u16,
                         gpu: gpu_load.as_mut().and_then(connect_gpu_load::Monitor::sample),
+                        perf: reporter.report(trace).map(Box::new),
                     };
                     net::write_msg(&mut send, &stats).await?;
                 }
@@ -330,7 +341,9 @@ async fn stream(
                 net::write_msg(&mut send, &HostMsg::InputUnavailable { device, reason }).await?;
             }
             event = video.next() => match event {
-                Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame, rate.loss())?,
+                Some(Ok(VideoEvent::Frame(frame, stamp))) => {
+                    send_frame(conn, &frame, stamp, rate.loss(), rate.bitrate() / 1000, trace)?;
+                }
                 Some(Ok(VideoEvent::Encoder { name, codec })) => {
                     net::write_msg(&mut send, &HostMsg::VideoEncoder { name, codec }).await?;
                 }
@@ -395,17 +408,54 @@ async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<Result<ClientMsg>>) {
 }
 
 /// Sends one frame, with recovery data in proportion to how lossy the path has been.
-fn send_frame(conn: &Connection, frame: &EncodedFrame, loss: f32) -> Result<()> {
+fn send_frame(
+    conn: &Connection,
+    frame: &EncodedFrame,
+    stamp: FrameStamp,
+    loss: f32,
+    bitrate_kbps: u32,
+    trace: &HostTrace,
+) -> Result<()> {
+    let started = Instant::now();
     let max = conn.max_datagram_size().context("the client doesn't accept video datagrams")?;
     let data_chunks = frame.data.len().div_ceil(max.saturating_sub(video::HEADER_LEN).max(2) & !1);
     let recovery = video::recovery_count(data_chunks, loss, frame.meta.keyframe);
+    let tracing = connect_perf::enabled();
+    let queued_bytes = if tracing { net::queued_datagram_bytes(conn) } else { 0 };
     let sent_after = connect_proto::now_micros().saturating_sub(frame.meta.capture_time_us);
     let meta = video::FrameMeta { sent_after_us: sent_after.min(u64::from(u32::MAX)) as u32, ..frame.meta };
     let chunks = video::packetize(meta, &frame.data, max, recovery)?;
     if frame.meta.keyframe {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), datagrams = chunks.len(), max, "sending keyframe");
     }
-    match conn.send_many_datagrams(&chunks) {
+    let packetized = Instant::now();
+    let result = conn.send_many_datagrams(&chunks);
+    if tracing {
+        let micros = |d: Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
+        trace.frames.push(FrameRecord {
+            seq: meta.seq,
+            keyframe: meta.keyframe,
+            codec: meta.codec,
+            resent: stamp.resent,
+            capture: stamp.capture,
+            bytes: frame.data.len().min(u32::MAX as usize) as u32,
+            capture_time_us: meta.capture_time_us,
+            present_to_capture_us: meta.present_to_capture_us,
+            capture_us: meta.capture_us,
+            held_us: stamp.held_us,
+            encode_us: meta.encode_time_us,
+            queue_us: micros(started.saturating_duration_since(stamp.encoded)),
+            packetize_us: micros(packetized - started),
+            send_us: micros(packetized.elapsed()),
+            sent_after_us: meta.sent_after_us,
+            datagrams: chunks.len().min(u16::MAX as usize) as u16,
+            recovery: recovery.min(u16::MAX as usize) as u16,
+            queued_bytes: queued_bytes.min(u32::MAX as usize) as u32,
+            bitrate_kbps,
+            dropped: matches!(result, Err(SendDatagramError::TooLarge)),
+        });
+    }
+    match result {
         Ok(_) => Ok(()),
         // The path MTU shrank; the client will notice the gap and ask for a keyframe.
         Err(SendDatagramError::TooLarge) => {
@@ -413,6 +463,16 @@ fn send_frame(conn: &Connection, frame: &EncodedFrame, loss: f32) -> Result<()> 
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Writes the session's trace as CSV, if a trace directory is set.
+async fn write_trace(trace: Arc<HostTrace>) {
+    let Some(dir) = connect_perf::trace_dir().filter(|_| connect_perf::enabled()) else { return };
+    match tokio::task::spawn_blocking(move || trace.write(&dir).map(|()| dir)).await {
+        Ok(Ok(dir)) => info!(dir = %dir.display(), "performance trace written"),
+        Ok(Err(error)) => warn!("couldn't write the performance trace: {error}"),
+        Err(error) => warn!("writing the performance trace stopped: {error}"),
     }
 }
 

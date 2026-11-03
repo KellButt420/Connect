@@ -1,5 +1,11 @@
 # Connect
 
+Version 0.8.0 measures. Every frame is traced from the host's screen to the viewer's window,
+and every input event from the viewer to the host. The stats overlay (Ctrl+Alt+S) shows
+p50/p95/p99 latency, frame-time spread, dropped and repeated frames, and each PC's CPU and
+memory use. Ctrl+Alt+E saves the trace as CSV for analysis. [METRICS.md](METRICS.md) explains
+every figure and its limits. Its protocol is 8, so both PCs need 0.8.0.
+
 Version 0.7.0 draws hardware-decoded video straight from the graphics card, shows where every
 millisecond of latency goes and how busy each graphics card is (Ctrl+Alt+S), and adds a
 **Smooth** frame pacing option. Video uses H.265 in hardware when both PCs' graphics cards handle
@@ -113,7 +119,8 @@ from capture, the overlay is hidden to prevent duplicate pointers.
 |---|---|
 | Ctrl+Alt+M | Capture the mouse for games (raw movement, hidden pointer), and release it again |
 | Ctrl+Alt+F | Full screen |
-| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), frames lost / repaired / skipped, packet loss; latency stage by stage, from the host's screen to this window; how busy each PC's graphics card is |
+| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), packet loss; frames lost / repaired / skipped / superseded, dropped and repeated in the last second, frame-time spread; latency from the host's screen to this window (p50/p95/p99) and stage by stage; input latency to the host; each PC's CPU, memory and graphics-card load. See [METRICS.md](METRICS.md) |
+| Ctrl+Alt+E | Save the session's performance trace as CSV (see [METRICS.md](METRICS.md)) |
 
 All other keys, including F-keys and Esc, go to the host.
 

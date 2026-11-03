@@ -3,9 +3,9 @@
 //! With no arguments this opens the app. The headless commands exist for testing without a display:
 //!
 //! ```text
-//! connect host [--test-pattern[=WxH@FPS]] [--print-input]
+//! connect host [--test-pattern[=WxH@FPS]] [--print-input] [--trace DIR]
 //!                                     share this PC (Windows); Allow/Deny is asked on the terminal
-//! connect join <USER-ID> [--seconds N]
+//! connect join <USER-ID> [--seconds N] [--trace DIR]
 //! connect id                          print this PC's User-ID
 //! connect gpu-check                   check what the graphics hardware offers, and test it
 //! ```
@@ -20,6 +20,8 @@
 //!
 //! Set `CONNECT_CONFIG_DIR` to use a separate identity, e.g. to run two copies on one PC, and
 //! `CONNECT_RENDERER=separate` to keep the window off the video decoder's graphics device.
+//! `CONNECT_TRACE=DIR` (or `--trace DIR`) writes each session's performance trace there as CSV;
+//! `CONNECT_TRACE=0` turns tracing off. See METRICS.md.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -37,9 +39,9 @@ use tracing_subscriber::{filter::Targets, prelude::*};
 
 const USAGE: &str = "\
 usage: connect                        open the app
-       connect host [--test-pattern[=WxH@FPS]] [--print-input]
+       connect host [--test-pattern[=WxH@FPS]] [--print-input] [--trace DIR]
                                       share this PC from the terminal (Windows)
-       connect join <USER-ID> [--seconds N]
+       connect join <USER-ID> [--seconds N] [--trace DIR]
        connect id                     print this PC's User-ID
        connect gpu-check              check this PC's graphics hardware and save a report";
 
@@ -100,22 +102,72 @@ fn device_name() -> String {
     if name.is_empty() { "My PC".into() } else { name }
 }
 
-/// Session figures for the terminal and the in-session overlay: the connection, then where
-/// the latency goes.
+/// Session figures for the terminal and the in-session overlay: the connection, how smoothly
+/// frames come, where the latency goes (percentiles, from the performance trace), input, and
+/// what each PC spends on it. METRICS.md says what each figure measures.
 pub(crate) fn stats_line(s: &Stats) -> String {
     let rtt = s.rtt.map_or("–".into(), |r| format!("{:.0} ms", r.as_secs_f32() * 1000.0));
     let target = s.host_mbps.map_or(String::new(), |m| format!(" (target {m:.1})"));
     let loss = s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}%", l * 100.0));
     let mut text = format!(
-        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target} · frames lost {} / repaired {} / skipped {}{loss}",
+        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target}{loss}\nFrames lost {} · repaired {} · skipped {} · superseded {}",
         s.path.label(),
         s.fps,
         s.mbps,
         s.frames_lost,
         s.frames_recovered,
+        s.frames_skipped,
         s.frames_superseded,
     );
-    if let Some(l) = &s.latency {
+    let ms = |us: i64| format!("{:.1}", us as f64 / 1000.0);
+    let p50 = |p: Option<connect_client::Percentiles>| p.map_or("–".into(), |p| ms(p.p50));
+    if let Some(f) = &s.frames {
+        text += &format!(" · last second: dropped {}, repeated ~{}", s.dropped, f.repeated);
+        if let (Some(time), Some(interval)) = (f.frame_time, f.frame_interval) {
+            text += &format!(" · frame time {:.1} ± {:.1} ms (p99 {})", time.mean, time.stddev, ms(interval.p99));
+        }
+        let clock = s.clock.map_or(String::new(), |c| format!(", clocks ±{} ms", ms(c.uncertainty_us as i64)));
+        text += &match f.total {
+            Some(t) => format!(
+                "\nLatency to this window (est.{clock}): p50 {} · p95 {} · p99 {} · max {} ms",
+                ms(t.p50),
+                ms(t.p95),
+                ms(t.p99),
+                ms(t.max)
+            ),
+            None => "\nLatency to this window: measuring…".into(),
+        };
+        let host = s.host_perf;
+        let from_host =
+            |pick: fn(&connect_client::HostPerf) -> Option<connect_client::Percentiles>| host.as_ref().and_then(pick);
+        let send = match host {
+            Some(h) => format!(
+                "held {} · queue {} · packetize {} · send {}",
+                p50(h.held),
+                p50(h.queue),
+                p50(h.packetize),
+                p50(h.send)
+            ),
+            None => format!("send wait {}", p50(f.host_wait)),
+        };
+        text += &format!(
+            "\n  p50 host: screen→capture {} · capture {} · GPU convert {} · encode {} · {send} ms",
+            p50(f.present_to_capture),
+            p50(from_host(|h| h.capture).or(f.capture)),
+            p50(from_host(|h| h.convert_gpu)),
+            p50(from_host(|h| h.encode).or(f.encode)),
+        );
+        text += &format!(
+            "\n  p50 here: network {} (est.) · reassembly {} · decode queue {} · decode {} on {} · draw {} ms",
+            p50(f.network),
+            p50(f.reassembly),
+            p50(f.decode_queue),
+            p50(f.decode),
+            if s.gpu_decode { "GPU" } else { "CPU" },
+            p50(f.render),
+        );
+    } else if let Some(l) = &s.latency {
+        // Tracing is off: the running averages still work.
         let ms = |v: f32| format!("{v:.1}");
         let maybe = |v: Option<f32>| v.map_or("–".into(), ms);
         let total = match (l.total, l.worst) {
@@ -124,7 +176,7 @@ pub(crate) fn stats_line(s: &Stats) -> String {
         };
         text += &format!(
             "\nLatency to this window {total}: host screen→capture {} · capture {} · encode {} · send wait {} · \
-             network {} · reassembly {} · decode {} on {} · draw {} ms",
+             network {} · reassembly {} · decode {} on {} · draw {} ms (averages)",
             maybe(l.present_to_capture),
             ms(l.capture),
             ms(l.encode),
@@ -134,6 +186,31 @@ pub(crate) fn stats_line(s: &Stats) -> String {
             ms(l.decode),
             if s.gpu_decode { "GPU" } else { "CPU" },
             ms(l.render),
+        );
+    }
+    let inject = s.host_perf.and_then(|h| h.input_inject);
+    if let Some(one_way) = s.input_one_way() {
+        text += &format!(
+            "\nInput to host (est.): p50 {} · p95 {} · p99 {} ms · injecting {} ms",
+            ms(one_way.p50),
+            ms(one_way.p95),
+            ms(one_way.p99),
+            p50(inject)
+        );
+    }
+    let process = |load: Option<connect_client::ProcessLoad>| {
+        load.map(|p| {
+            let share = p.cpu_percent / f32::from(p.cores.max(1));
+            format!("CPU {share:.1}% ({:.2} cores) · {:.0} MB", p.cpu_percent / 100.0, p.memory_bytes as f64 / 1e6)
+        })
+    };
+    let host_process = s.host_perf.and_then(|h| h.process);
+    if host_process.is_some() || s.process.is_some() {
+        let unknown = || "–".to_owned();
+        text += &format!(
+            "\nHost {} · here {}",
+            process(host_process).unwrap_or_else(unknown),
+            process(s.process).unwrap_or_else(unknown)
         );
     }
     let gpu = |load: Option<connect_client::GpuLoad>| {
@@ -155,6 +232,10 @@ pub(crate) fn stats_line(s: &Stats) -> String {
             gpu(s.host_gpu).unwrap_or_else(unknown),
             gpu(s.gpu).unwrap_or_else(unknown)
         );
+    }
+    let dropped = s.trace_dropped + s.host_perf.map_or(0, |h| h.trace_dropped);
+    if dropped > 0 {
+        text += &format!("\n{dropped} trace records dropped (buffer busy)");
     }
     text
 }

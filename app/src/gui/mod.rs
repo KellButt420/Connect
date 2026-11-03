@@ -278,6 +278,8 @@ struct ClientSession {
     gamepads: Option<gamepad::Forwarder>,
     /// A short message over the video, e.g. that the host changed permissions.
     note: Option<(String, Instant)>,
+    /// What became of the last performance trace export, once it's done.
+    exported: Arc<Mutex<Option<String>>>,
 }
 
 impl ClientSession {
@@ -402,6 +404,7 @@ impl App {
             input: input::InputCapture::default(),
             gamepads: None,
             note: None,
+            exported: Default::default(),
         });
         self.notice = None;
     }

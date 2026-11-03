@@ -103,29 +103,40 @@ start there. It is now loaded when first needed, and hosting falls back to OpenH
 
 ## Reading the stats (Ctrl+Alt+S)
 
-- **fps**: frames decoded per second on the viewer.
-- **Mb/s (target)**: received video rate; the host's current bitrate target follows the
-  connection and stays at or below the Settings cap.
-- **Latency to this window**: from the image appearing on the host's screen to it being drawn
-  here, on average, and the slowest frame of the last second, through an estimated clock
-  offset. The time until the display shows it (at most one refresh) comes on top. By stage:
-  - *host screen→capture*: Windows showing the image to capture picking it up
-  - *capture*: copying it and converting its colours
-  - *encode*
-  - *send wait*: waiting for the network and packetizing
-  - *network*
-  - *reassembly*: the rest of the frame's packets, rebuilding lost ones, the decoder's queue
-  - *decode*
-  - *draw*: decoded to drawn into the window
-- **GPU load**: the busiest engine of each kind (graphics, video encoder, video decoder) on
-  each PC, where Windows reports it (any vendor), or AMD's driver on Linux.
-- **frames lost / repaired / skipped**: lost is frames that couldn't be rebuilt (each costs a
-  short freeze); repaired is frames rebuilt from recovery packets; skipped is frames decoded
-  but replaced by a newer one before the screen showed them.
-- **packet loss**: what the host sees going missing on the path, over the last second or so.
+Since 0.8.0 the figures come from the performance trace. [METRICS.md](METRICS.md) defines each
+one, its clock and its limits.
 
-Steady growth in *lost* means the path loses more than recovery covers. *Skipped* climbing
-fast means the viewer can't display as fast as frames arrive.
+- **fps**: frames decoded per second on the viewer.
+- **Mb/s (target)**: received video rate. The host's current bitrate target follows the
+  connection and stays at or below the Settings cap.
+- **packet loss**: what the host sees going missing on the path, over the last second or so.
+- **Frames lost / repaired / skipped / superseded**, running totals:
+  - *lost*: frames that couldn't be rebuilt. Each costs a short freeze.
+  - *repaired*: frames rebuilt from recovery packets.
+  - *skipped*: complete frames thrown away because an earlier one was lost.
+  - *superseded*: frames decoded but replaced by a newer one before the screen showed them.
+- **last second: dropped, repeated**:
+  - *dropped*: lost + skipped + superseded in the last second.
+  - *repeated*: an estimate of the frame times a picture stayed up longer than the stream's
+    cadence called for.
+- **frame time**: mean ± standard deviation of the gaps between frames drawn, and their 99th
+  percentile.
+- **Latency to this window (est.)**: from the image appearing on the host's screen to it being
+  drawn here. Shown as p50/p95/p99 and the slowest frame of the last second, through an
+  estimated clock offset whose uncertainty is shown. The display adds up to one refresh on top.
+  Then the p50 of each stage:
+  - host: screen→capture, capture, GPU convert, encode, held, queue, packetize, send
+  - here: network (est.), reassembly, decode queue, decode, draw
+- **Input to host (est.)**: the time an input event takes to reach the host, p50/p95/p99, and how
+  long the host takes to inject it.
+- **Host / here**: each PC's CPU (share of all cores, and cores in use) and memory (working set
+  or RSS).
+- **GPU load**: the busiest engine of each kind (graphics, video encoder, video decoder) on
+  each PC. Windows reports it for any vendor; on Linux, only AMD's driver does.
+
+Steady growth in *lost* means the path loses more than recovery covers. *Superseded* climbing
+fast means the viewer can't display as fast as frames arrive. With `CONNECT_TRACE=0` the
+latency line falls back to plain averages.
 
 ## Version 0.3.0: GPU encoding
 

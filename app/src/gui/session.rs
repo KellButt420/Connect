@@ -39,6 +39,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         match hotkey {
             Hotkey::Fullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen)),
             Hotkey::Stats => client.show_stats = !client.show_stats,
+            Hotkey::ExportTrace => export_trace(&ctx, client),
             Hotkey::MouseCapture => {
                 let capture = !client.input.captured && permissions.allows(DeviceClass::Mouse);
                 set_captured(&ctx, client, capture);
@@ -92,6 +93,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         );
         ui.painter().add(Glass::OVERLAY.shapes(rect, 12.0));
         ui.painter().galley(rect.min + egui::vec2(10.0, 7.0), galley, Color32::WHITE);
+    }
+    let exported = client.exported.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(result) = exported {
+        client.note(result, 8);
     }
     if let Some((text, until)) = &client.note {
         if Instant::now() < *until {
@@ -305,6 +310,31 @@ fn fit(size: egui::Vec2, area: Rect) -> Rect {
     Rect::from_center_size(area.center(), size * (area.width() / size.x).min(area.height() / size.y))
 }
 
+/// Saves the session's performance trace as CSV, off the UI thread, and says where when it's
+/// done: in the trace directory if one is set (`CONNECT_TRACE`), otherwise in `connect-traces`
+/// next to where the app was started, like `gpu-check`'s report.
+fn export_trace(ctx: &egui::Context, client: &mut ClientSession) {
+    let dir = connect_perf::trace_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).join("connect-traces"));
+    client.note("Saving the performance trace…", 2);
+    let (handle, result, ctx) = (client.handle.clone(), client.exported.clone(), ctx.clone());
+    let spawned = std::thread::Builder::new().name("connect-trace-export".into()).spawn(move || {
+        let fallback = std::env::temp_dir().join("connect-traces");
+        let text = match handle.export_trace(&dir).or_else(|_| handle.export_trace(&fallback)) {
+            Ok(files) => {
+                let folder = files.first().and_then(|f| f.parent()).map_or(dir, std::path::Path::to_path_buf);
+                format!("Performance trace saved to {}", folder.display())
+            }
+            Err(error) => format!("Couldn't save the performance trace: {error}"),
+        };
+        *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
+        ctx.request_repaint();
+    });
+    if let Err(error) = spawned {
+        client.note(format!("Couldn't save the performance trace: {error}"), 6);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +476,7 @@ mod tests {
                     input: Default::default(),
                     gamepads: None,
                     note: None,
+                    exported: Default::default(),
                 });
                 Ok(Box::new(Probe {
                     app,

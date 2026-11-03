@@ -159,24 +159,27 @@ fn decode(
             return false;
         }
     };
+    let timing = FrameTiming {
+        meta: frame.meta,
+        arrival: frame.arrival,
+        bytes: frame.data.len().min(u32::MAX as usize) as u32,
+        hardware: decoder.hardware(),
+        decode_started: Some(started),
+        decoded: Some(Instant::now()),
+        ..Default::default()
+    };
     let c = &shared.counters;
     if c.frames_decoded.fetch_add(1, Ordering::Relaxed) == 0 {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), "first frame decoded");
     }
     let Some(buf) = buf else {
         c.frames_superseded.fetch_add(1, Ordering::Relaxed);
+        shared.record(&timing);
         return true;
     };
 
     c.decode_us.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     c.encode_us.store(frame.meta.encode_time_us as u64, Ordering::Relaxed);
-    let timing = FrameTiming {
-        meta: frame.meta,
-        first_seen: frame.first_seen,
-        decode_started: Some(started),
-        decoded: Some(Instant::now()),
-        painted: None,
-    };
     let frame = VideoFrame {
         width: decoded.width as u32,
         height: decoded.height as u32,
@@ -191,6 +194,7 @@ fn decode(
     let replaced = lock(&shared.frame).push(frame, (offset != i64::MIN).then_some(offset), smooth);
     for unseen in replaced {
         c.frames_superseded.fetch_add(1, Ordering::Relaxed);
+        shared.record(&unseen.timing);
         crate::recycle(shared, unseen.yuv);
     }
     (shared.wake)();
@@ -259,5 +263,6 @@ pub(crate) async fn receive(
         let c = &shared.counters;
         c.frames_lost.store(stats.frames_lost, Ordering::Relaxed);
         c.frames_recovered.store(stats.frames_recovered, Ordering::Relaxed);
+        c.frames_skipped.store(stats.frames_skipped, Ordering::Relaxed);
     }
 }

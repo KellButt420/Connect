@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     capture::{Capturer, VideoSource},
+    trace::HostTrace,
     yuv::{Layout, Picture},
 };
 
@@ -48,11 +49,24 @@ pub(crate) enum VideoEvent {
         width: u32,
         height: u32,
     },
-    Frame(EncodedFrame),
+    Frame(EncodedFrame, FrameStamp),
     Encoder {
         name: String,
         codec: Codec,
     },
+}
+
+/// Timings that go with a frame from the video thread to the session, for the trace; not sent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameStamp {
+    /// Which capture the picture came from.
+    pub capture: u64,
+    /// A static picture encoded again as a keyframe, rather than a new one.
+    pub resent: bool,
+    /// From the picture being staged to the encoder starting on it.
+    pub held_us: u32,
+    /// When the encoder handed the frame over.
+    pub encoded: Instant,
 }
 
 /// True while the network is too backed up to take another frame.
@@ -74,7 +88,13 @@ pub(crate) struct VideoStream {
 }
 
 impl VideoStream {
-    pub fn start(source: VideoSource, codec: Codec, bitrate_bps: u32, backlogged: Backlogged) -> Result<Self> {
+    pub fn start(
+        source: VideoSource,
+        codec: Codec,
+        bitrate_bps: u32,
+        backlogged: Backlogged,
+        trace: Arc<HostTrace>,
+    ) -> Result<Self> {
         // Small, so a slow network pushes back on the encoder instead of queueing stale frames.
         let (tx, events) = mpsc::channel(2);
         let control = Arc::new(Control {
@@ -88,7 +108,7 @@ impl VideoStream {
         std::thread::Builder::new()
             .name("connect-video".into())
             .spawn(move || {
-                if let Err(e) = run(&source, &tx, &thread) {
+                if let Err(e) = run(&source, &tx, &thread, &trace) {
                     let _ = tx.blocking_send(Err(e));
                 }
             })
@@ -296,7 +316,12 @@ struct Pipeline {
     encoder: Box<dyn VideoEncoder>,
 }
 
-fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Control) -> Result<()> {
+fn run(
+    source: &VideoSource,
+    tx: &mpsc::Sender<Result<VideoEvent>>,
+    control: &Control,
+    trace: &HostTrace,
+) -> Result<()> {
     let mut capturer = source.open()?;
     let fps = capturer.refresh_hz().unwrap_or(DEFAULT_FPS).clamp(30, 240);
     // Turned off for the rest of the stream once anything on the graphics-card path fails.
@@ -312,6 +337,9 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
     let mut picture_time_us = 0;
     // How long the staged picture took to capture, and how long it was on screen before that.
     let (mut picture_capture_us, mut picture_present_us) = (0, 0);
+    // For the trace: captures so far, and the staged picture's number and when it was staged.
+    let mut captures = 0u64;
+    let (mut picture_index, mut picture_staged) = (0u64, Instant::now());
     let mut sent_time_us = 0;
     // At most one picture per refresh of the host's screen (with a little slack for jitter): a
     // game presenting faster than that would spend bitrate on pictures the viewer never shows.
@@ -345,14 +373,26 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
             control.bitrate.load(Ordering::Relaxed),
             fps,
             timeout,
+            captures,
             &send,
         )?;
         let Some(fresh) = fresh else { return Ok(()) };
+        let staged = Instant::now();
         let now_us = clock_start + stream_start.elapsed().as_micros() as u64;
+        #[cfg(windows)]
+        if let Some(Pipeline { stage: Stage::Gpu(converter), .. }) = &mut pipeline {
+            converter.poll_timings(|capture, gpu_us| {
+                trace.conversions.push(crate::trace::ConvertRecord { capture, gpu_us });
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = trace;
         if fresh {
+            (picture_index, picture_staged) = (captures, staged);
+            captures += 1;
             picture_time_us = now_us;
             let timing = capturer.timing();
-            picture_capture_us = micros(timing.acquired.elapsed());
+            picture_capture_us = micros(staged.saturating_duration_since(timing.acquired));
             picture_present_us = timing.present_to_capture.map_or(0, micros);
             unsent = true;
         }
@@ -382,6 +422,7 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
         }
         last_sent = Some(Instant::now());
         control.keyframe.store(false, Ordering::Relaxed);
+        let resent = !unsent;
         unsent = false;
         // Stamped when captured; a static picture sent again as a keyframe is stamped anew, as
         // hardware encoders need every timestamp later than the last.
@@ -425,7 +466,14 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
             }
             Err(error) => return Err(error.context("encoding frame")),
         };
-        let encode_time_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        let encoded_at = Instant::now();
+        let encode_time_us = micros(encoded_at.duration_since(started));
+        let stamp = FrameStamp {
+            capture: picture_index,
+            resent,
+            held_us: if resent { 0 } else { micros(started.saturating_duration_since(picture_staged)) },
+            encoded: encoded_at,
+        };
         let codec = active.encoder.codec();
         for picture in encoded {
             let meta = FrameMeta {
@@ -440,7 +488,7 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
                 sent_after_us: 0,
             };
             seq = seq.wrapping_add(1);
-            if !send(VideoEvent::Frame(EncodedFrame { meta, data: picture.data, first_seen: None })) {
+            if !send(VideoEvent::Frame(EncodedFrame { meta, data: picture.data, arrival: None }, stamp)) {
                 return Ok(());
             }
         }
@@ -487,6 +535,7 @@ fn capture(
     bitrate: u32,
     fps: u32,
     timeout: Duration,
+    capture_index: u64,
     send: &dyn Fn(VideoEvent) -> bool,
 ) -> Result<Option<bool>> {
     // Announces a new size and encoder; false if the session has gone.
@@ -503,7 +552,7 @@ fn capture(
     #[cfg_attr(not(windows), expect(unused_mut))]
     let mut read_back_latest = false;
     #[cfg(not(windows))]
-    let _ = gpu;
+    let _ = (gpu, capture_index);
 
     #[cfg(windows)]
     if *gpu && let Some(dxgi) = capturer.as_dxgi() {
@@ -531,7 +580,7 @@ fn capture(
         }
         if *gpu {
             let Some(Pipeline { stage: Stage::Gpu(converter), .. }) = pipeline else { unreachable!("built above") };
-            match converter.convert(dxgi.latest()) {
+            match converter.convert(dxgi.latest(), Some(capture_index)) {
                 Ok(()) => return Ok(Some(true)),
                 Err(error) => {
                     tracing::warn!("GPU colour conversion failed, going through memory: {error:#}");
