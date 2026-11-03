@@ -262,6 +262,48 @@ impl Reporter {
     }
 }
 
+/// What to do with one GPU timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum TimerVerdict {
+    Keep,
+    /// Start and end read the same: the timestamps didn't bracket the work.
+    Skip,
+    /// Only such readings so far: this driver's timestamps don't cover the work at all.
+    GiveUp,
+}
+
+/// Screens GPU timings for ones that can't be real. Some drivers run the video processor
+/// outside the command stream that timestamp queries mark, so both timestamps land at the same
+/// point and every conversion reads 0 µs (seen on an RTX 5060). Those are dropped. A timer that
+/// has produced nothing else after [`Self::GIVE_UP_AFTER`] readings is given up on, so the stage
+/// shows as unmeasured rather than as 0.
+#[derive(Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct TimerCheck {
+    empty_in_a_row: u32,
+    seen_real: bool,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl TimerCheck {
+    pub const GIVE_UP_AFTER: u32 = 32;
+
+    /// `ticks` is end minus start.
+    pub fn check(&mut self, ticks: u64) -> TimerVerdict {
+        if ticks > 0 {
+            (self.seen_real, self.empty_in_a_row) = (true, 0);
+            return TimerVerdict::Keep;
+        }
+        self.empty_in_a_row += 1;
+        if !self.seen_real && self.empty_in_a_row >= Self::GIVE_UP_AFTER {
+            TimerVerdict::GiveUp
+        } else {
+            TimerVerdict::Skip
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use connect_perf::Percentiles;
@@ -300,6 +342,23 @@ mod tests {
         let third = reporter.report(&trace).unwrap();
         assert_eq!(p50(third.capture), Some(7));
         assert_eq!(third.held, None, "a re-sent picture wasn't held");
+    }
+
+    #[test]
+    fn empty_gpu_timings_are_dropped_then_given_up_on() {
+        let mut check = TimerCheck::default();
+        for _ in 1..TimerCheck::GIVE_UP_AFTER {
+            assert_eq!(check.check(0), TimerVerdict::Skip);
+        }
+        assert_eq!(check.check(0), TimerVerdict::GiveUp, "never a real reading");
+
+        // A timer that works but now and then reads 0 keeps going, minus those readings.
+        let mut check = TimerCheck::default();
+        assert_eq!(check.check(5_000), TimerVerdict::Keep);
+        for _ in 0..100 {
+            assert_eq!(check.check(0), TimerVerdict::Skip);
+        }
+        assert_eq!(check.check(4_000), TimerVerdict::Keep);
     }
 
     #[test]

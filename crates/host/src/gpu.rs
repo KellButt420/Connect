@@ -34,7 +34,10 @@ use windows::{
     core::Interface,
 };
 
-use crate::yuv::{Layout, Picture};
+use crate::{
+    trace::TimerVerdict,
+    yuv::{Layout, Picture},
+};
 
 pub(crate) struct Nv12Converter {
     device: ID3D11Device,
@@ -213,8 +216,11 @@ impl Nv12Converter {
     /// Conversions the graphics card has finished timing since the last call, oldest first: their
     /// tags and run times in µs. Never waits for the card.
     pub fn poll_timings(&mut self, out: impl FnMut(u64, u32)) {
-        if let Some(timer) = &mut self.timer {
-            timer.poll(&self.context, out);
+        if let Some(timer) = &mut self.timer
+            && !timer.poll(&self.context, out)
+        {
+            tracing::info!("this driver's GPU timestamps don't cover the colour conversion; not timing it");
+            self.timer = None;
         }
     }
 
@@ -256,6 +262,7 @@ const TIMER_SLOTS: usize = 4;
 /// says whether the counter's frequency held steady in between.
 struct GpuTimer {
     slots: Vec<TimerSlot>,
+    check: crate::trace::TimerCheck,
     /// The slot the next timing uses; the oldest in flight.
     next: usize,
 }
@@ -284,7 +291,11 @@ impl GpuTimer {
                 tag: None,
             })
         };
-        Some(Self { slots: (0..TIMER_SLOTS).map(|_| slot()).collect::<Option<_>>()?, next: 0 })
+        Some(Self {
+            slots: (0..TIMER_SLOTS).map(|_| slot()).collect::<Option<_>>()?,
+            next: 0,
+            check: Default::default(),
+        })
     }
 
     /// Marks the start; `None` (untimed) if the slot is still waiting for an earlier result.
@@ -311,7 +322,9 @@ impl GpuTimer {
         self.next = (at + 1) % self.slots.len();
     }
 
-    fn poll(&mut self, context: &ID3D11DeviceContext, mut out: impl FnMut(u64, u32)) {
+    /// Hands over the timings that are ready. False once the timings have proved meaningless
+    /// (see [`crate::trace::TimerCheck`]), so the timer should be dropped.
+    fn poll(&mut self, context: &ID3D11DeviceContext, mut out: impl FnMut(u64, u32)) -> bool {
         let count = self.slots.len();
         for i in 0..count {
             let slot = &mut self.slots[(self.next + i) % count];
@@ -324,11 +337,19 @@ impl GpuTimer {
             let (start, end) = unsafe { (ready::<u64>(context, &slot.start), ready::<u64>(context, &slot.end)) };
             let (Some(start), Some(end)) = (start, end) else { break };
             slot.tag = None;
-            if !disjoint.Disjoint.as_bool() && disjoint.Frequency > 0 && end >= start {
-                let us = u128::from(end - start) * 1_000_000 / u128::from(disjoint.Frequency);
-                out(tag, us.min(u128::from(u32::MAX)) as u32);
+            if disjoint.Disjoint.as_bool() || disjoint.Frequency == 0 || end < start {
+                continue;
+            }
+            match self.check.check(end - start) {
+                TimerVerdict::Keep => {
+                    let us = u128::from(end - start) * 1_000_000 / u128::from(disjoint.Frequency);
+                    out(tag, us.min(u128::from(u32::MAX)) as u32);
+                }
+                TimerVerdict::Skip => {}
+                TimerVerdict::GiveUp => return false,
             }
         }
+        true
     }
 }
 
