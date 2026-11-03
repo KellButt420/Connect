@@ -267,15 +267,16 @@ impl Reporter {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum TimerVerdict {
     Keep,
-    /// Start and end read the same: the timestamps didn't bracket the work.
+    /// Too short to be the conversion: the timestamps didn't bracket the work.
     Skip,
     /// Only such readings so far: this driver's timestamps don't cover the work at all.
     GiveUp,
 }
 
 /// Screens GPU timings for ones that can't be real. Some drivers run the video processor
-/// outside the command stream that timestamp queries mark, so both timestamps land at the same
-/// point and every conversion reads 0 µs (seen on an RTX 5060). Those are dropped. A timer that
+/// outside the command stream that timestamp queries mark, so both timestamps land at nearly the
+/// same point and every conversion reads under 1 µs (seen on an RTX 5060: 0 µs after rounding,
+/// though not always 0 ticks). Readings under [`Self::MIN_US`] are dropped. A timer that
 /// has produced nothing else after [`Self::GIVE_UP_AFTER`] readings is given up on, so the stage
 /// shows as unmeasured rather than as 0.
 #[derive(Debug, Default)]
@@ -288,10 +289,14 @@ pub(crate) struct TimerCheck {
 #[cfg_attr(not(windows), allow(dead_code))]
 impl TimerCheck {
     pub const GIVE_UP_AFTER: u32 = 32;
+    /// Shorter than this can't be a 1080p conversion on a graphics card; it's timestamps that
+    /// missed the work.
+    pub const MIN_US: u64 = 5;
 
-    /// `ticks` is end minus start.
-    pub fn check(&mut self, ticks: u64) -> TimerVerdict {
-        if ticks > 0 {
+    /// `ticks` is end minus start, at `frequency` ticks a second.
+    pub fn check(&mut self, ticks: u64, frequency: u64) -> TimerVerdict {
+        let us = u128::from(ticks) * 1_000_000 / u128::from(frequency.max(1));
+        if us >= u128::from(Self::MIN_US) {
             (self.seen_real, self.empty_in_a_row) = (true, 0);
             return TimerVerdict::Keep;
         }
@@ -344,21 +349,30 @@ mod tests {
         assert_eq!(third.held, None, "a re-sent picture wasn't held");
     }
 
+    const GHZ: u64 = 1_000_000_000;
+
     #[test]
     fn empty_gpu_timings_are_dropped_then_given_up_on() {
         let mut check = TimerCheck::default();
         for _ in 1..TimerCheck::GIVE_UP_AFTER {
-            assert_eq!(check.check(0), TimerVerdict::Skip);
+            assert_eq!(check.check(0, GHZ), TimerVerdict::Skip);
         }
-        assert_eq!(check.check(0), TimerVerdict::GiveUp, "never a real reading");
+        assert_eq!(check.check(0, GHZ), TimerVerdict::GiveUp, "never a real reading");
+
+        // A few hundred ticks of a 1 GHz counter is under a microsecond: also not real.
+        let mut check = TimerCheck::default();
+        for _ in 1..TimerCheck::GIVE_UP_AFTER {
+            assert_eq!(check.check(400, GHZ), TimerVerdict::Skip);
+        }
+        assert_eq!(check.check(400, GHZ), TimerVerdict::GiveUp);
 
         // A timer that works but now and then reads 0 keeps going, minus those readings.
         let mut check = TimerCheck::default();
-        assert_eq!(check.check(5_000), TimerVerdict::Keep);
+        assert_eq!(check.check(250_000, GHZ), TimerVerdict::Keep);
         for _ in 0..100 {
-            assert_eq!(check.check(0), TimerVerdict::Skip);
+            assert_eq!(check.check(0, GHZ), TimerVerdict::Skip);
         }
-        assert_eq!(check.check(4_000), TimerVerdict::Keep);
+        assert_eq!(check.check(200_000, GHZ), TimerVerdict::Keep);
     }
 
     #[test]

@@ -340,7 +340,7 @@ impl GpuTimer {
             if disjoint.Disjoint.as_bool() || disjoint.Frequency == 0 || end < start {
                 continue;
             }
-            match self.check.check(end - start) {
+            match self.check.check(end - start, disjoint.Frequency) {
                 TimerVerdict::Keep => {
                     let us = u128::from(end - start) * 1_000_000 / u128::from(disjoint.Frequency);
                     out(tag, us.min(u128::from(u32::MAX)) as u32);
