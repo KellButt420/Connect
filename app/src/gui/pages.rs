@@ -673,6 +673,10 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
         ui.add_space(gap);
     }
 
+    theme::card(ui, |ui| {
+        super::gamepad::settings_ui::show(ui, &app.gamepads, &mut app.settings.gamepad_profiles, &mut app.gamepad_editor);
+    });
+    ui.add_space(gap);
     app.updater.settings_card(ui);
 }
 

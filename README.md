@@ -65,6 +65,19 @@ The remote user's controller shows up as an Xbox 360 controller in the next free
 if the host has one plugged in, player 1 if not. The driver stays installed if Connect is deleted;
 remove it under Windows *Installed apps* ("ViGEm Bus Driver").
 
+**Settings → Gamepads** detects local USB controllers before connecting and shows their Xbox
+output. Select a controller, choose **Rebind**, press the desired physical control fully, release
+it, and **Apply**. Conflicting assignments are shown before reassignment. **Cancel** discards edits;
+**Reset to automatic**, then Apply, restores the driver layout. Saved layouts belong to this
+viewer and controller model, with separate Linux and Windows mappings. Up to four controllers
+can be forwarded. Disconnect the viewing session before editing mappings.
+
+Move sticks/triggers once and release everything before rebinding; pull triggers fully to
+capture their range. Testing stays local. **Controller diagnostics** shows device identity and
+source codes when investigating incorrect layouts. On Linux, check USB recognition and your
+desktop session's access to `/dev/input/event*` if nothing is detected; do not run the app as root
+or make all input devices world-readable. This feature targets USB; Bluetooth is not verified.
+
 The host's own mouse and keyboard always win: while the host is using one, the remote user's
 input on it pauses (and anything they held is released) until a second after the host stops.
 

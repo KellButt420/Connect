@@ -212,6 +212,8 @@ pub struct App {
     host_events: mpsc::UnboundedReceiver<HostEvent>,
     /// Whether this PC can give a remote user a gamepad, and setting that up.
     gamepad_driver: driver::GamepadDriver,
+    gamepads: gamepad::ControllerManager,
+    gamepad_editor: gamepad::settings_ui::Editor,
     /// Connection requests waiting for Allow/Deny, oldest first.
     requests: VecDeque<Request>,
     /// Who is using this PC right now.
@@ -275,7 +277,6 @@ struct ClientSession {
     shelf_open: bool,
     show_stats: bool,
     input: input::InputCapture,
-    gamepads: Option<gamepad::Forwarder>,
     /// A short message over the video, e.g. that the host changed permissions.
     note: Option<(String, Instant)>,
     /// What became of the last performance trace export, once it's done.
@@ -323,6 +324,8 @@ impl App {
         Self {
             endpoint,
             online,
+            gamepads: gamepad::ControllerManager::start(ctx.clone(), settings.gamepad_profiles.clone()),
+            gamepad_editor: Default::default(),
             settings,
             host,
             host_events: forward_host_events(events, ctx.clone()),
@@ -346,6 +349,7 @@ impl App {
     /// Hangs up as the app closes: the remote user's held input is released on this PC, and the
     /// other side is told at once rather than waiting to time out.
     fn shutdown(&mut self, runtime: &Handle) {
+        self.gamepads.stop();
         if let Some(client) = &self.client {
             client.handle.disconnect();
         }
@@ -402,7 +406,6 @@ impl App {
             shelf_open: true,
             show_stats: false,
             input: input::InputCapture::default(),
-            gamepads: None,
             note: None,
             exported: Default::default(),
         });
@@ -422,12 +425,13 @@ impl App {
                     self.connect_input.clear();
                     client.note(format!("Connected. You can use: {}.", describe(permissions)), 5);
                     client.state = ClientState::Connected { host_name, permissions };
-                    client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone()));
+                    self.gamepads.attach(client.handle.clone());
                 }
                 ClientEvent::PermissionsChanged(now) => {
                     if let ClientState::Connected { permissions, .. } = &mut client.state {
                         let before = std::mem::replace(permissions, now);
                         client.input.permissions_changed(now);
+                        if !now.allows(DeviceClass::Gamepad) { self.gamepads.set_active(false); }
                         if !now.allows(DeviceClass::Mouse) {
                             session::set_captured(ctx, client, false);
                         }
@@ -449,6 +453,7 @@ impl App {
             }
         }
         if let Some(reason) = ended {
+            self.gamepads.detach();
             session::set_captured(ctx, client, false);
             let is_error = !matches!(reason, connect_client::EndReason::Disconnected);
             self.client = None;
@@ -490,6 +495,8 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        let connected = self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. }));
+        self.gamepads.set_visible(!connected && self.page == Page::Settings);
         if self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. })) {
             session::show(self, ui);
         } else {
