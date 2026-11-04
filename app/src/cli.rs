@@ -17,9 +17,13 @@ use crate::{device_name, stats_line};
 pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     let mut video = VideoSource::default();
     let mut input = InputSink::default();
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--trace" => trace_into(args.next().context("--trace needs a directory")?)?,
             "--test-pattern" => video = VideoSource::TEST_PATTERN,
+            // e.g. --test-pattern=1920x1080@144
+            spec if spec.starts_with("--test-pattern=") => video = test_pattern(&spec["--test-pattern=".len()..])?,
             "--print-input" => {
                 let (tx, mut events) = mpsc::unbounded_channel();
                 tokio::spawn(async move {
@@ -89,6 +93,30 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Writes each session's performance trace into `dir` as CSV when it ends, tracing being on.
+fn trace_into(dir: &str) -> Result<()> {
+    let dir = std::path::PathBuf::from(dir);
+    if !connect_perf::set_trace_dir(dir.clone()) && connect_perf::trace_dir().as_ref() != Some(&dir) {
+        bail!("CONNECT_TRACE already names another trace directory");
+    }
+    connect_perf::set_enabled(true);
+    println!("Performance traces go to {}", dir.display());
+    Ok(())
+}
+
+fn test_pattern(spec: &str) -> Result<VideoSource> {
+    let parse = || -> Option<VideoSource> {
+        let (size, fps) = spec.split_once('@')?;
+        let (width, height) = size.split_once('x')?;
+        Some(VideoSource::TestPattern {
+            width: width.parse().ok()?,
+            height: height.parse().ok()?,
+            fps: fps.parse().ok()?,
+        })
+    };
+    parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS, like 1920x1080@144, not {spec:?}"))
+}
+
 pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
     // A User-ID is often pasted with spaces, so it may arrive split over several arguments.
     let mut id_parts = Vec::new();
@@ -97,17 +125,21 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = Some(args.next().context("--seconds needs a number")?.parse::<u64>()?),
+            "--trace" => trace_into(args.next().context("--trace needs a directory")?)?,
             part => id_parts.push(part),
         }
     }
     if id_parts.is_empty() {
-        bail!("usage: connect join <USER-ID> [--seconds N]");
+        bail!("usage: connect join <USER-ID> [--seconds N] [--trace DIR]");
     }
     let id = net::parse_user_id(&id_parts.concat())?;
 
     let endpoint = net::bind_endpoint(key).await?;
     let started = Instant::now();
-    let (client, mut events) = connect_client::connect(endpoint.clone(), id, device_name(), || {});
+    // Takes each frame as it's decoded, as a window would, so the stats count what was shown.
+    let woken = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wake = woken.clone();
+    let (client, mut events) = connect_client::connect(endpoint.clone(), id, device_name(), move || wake.notify_one());
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut connected_at = None;
 
@@ -126,7 +158,7 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 Some(ClientEvent::PermissionsChanged(p)) => println!("Host changed permissions to {:#05b}.", p.bits()),
                 Some(ClientEvent::VideoFormat { width, height }) => println!("Host screen is now {width}×{height}."),
                 Some(ClientEvent::InputUnavailable { reason, .. }) => println!("{reason}"),
-                Some(ClientEvent::VideoEncoder { name }) => println!("Video encoder: {name}"),
+                Some(ClientEvent::VideoEncoder { name, codec }) => println!("Video: {codec} · {name}"),
                 Some(ClientEvent::AudioStatus { active, reason }) => {
                     if let Some(reason) = reason { println!("{reason}"); }
                     else { println!("Desktop audio: {}", if active { "on" } else { "off" }); }
@@ -137,6 +169,13 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 }
                 None => break,
             },
+            _ = woken.notified() => {
+                if let Some(mut frame) = client.take_frame() {
+                    // No window to draw into: taking the frame stands in for drawing it.
+                    frame.timing.mark_painted();
+                    client.recycle(frame);
+                }
+            }
             _ = ticker.tick(), if connected_at.is_some() => {
                 let stats = client.stats();
                 if stats.rtt.is_some() {
@@ -165,4 +204,22 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
         }
     });
     rx
+}
+
+/// Checks what this PC's graphics hardware offers for sharing and viewing, runs the GPU paths
+/// briefly, and saves the report for pasting.
+pub fn gpu_check() -> Result<()> {
+    let mut report = Vec::new();
+    let mut out = |line: String| {
+        println!("{line}");
+        report.push(line);
+    };
+    out(format!("Connect {} GPU check on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, device_name()));
+    out("Testing for a few seconds; a video playing on the screen gives more realistic timings.".into());
+    connect_client::diagnostics::run(&mut out);
+    connect_host::diagnostics::run(&mut out);
+    let path = std::env::current_dir().unwrap_or_default().join("connect-gpu-check.txt");
+    std::fs::write(&path, report.join("\n") + "\n").with_context(|| format!("saving {}", path.display()))?;
+    println!("\nSaved to {}", path.display());
+    Ok(())
 }

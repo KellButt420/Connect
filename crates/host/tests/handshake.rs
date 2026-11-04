@@ -6,7 +6,7 @@ use connect_client::{ClientEvent, ClientHandle, EndReason, Stage};
 use connect_host::{Decision, HostConfig, HostEvent, HostHandle, InputSink, VideoSource};
 use connect_net::{self as net, iroh::Endpoint};
 use connect_proto::{
-    ALPN, DeviceClass, Permissions,
+    ALPN, Codec, CodecSupport, DeviceClass, Permissions,
     control::{ClientMsg, HostMsg},
     input::{GamepadState, InputEvent, MouseButton},
     video::FrameAssembler,
@@ -110,7 +110,7 @@ async fn allow_streams_video() {
         while frames < 10 {
             if let Some(frame) = client.take_frame() {
                 assert_eq!((frame.width, frame.height), (320, 240));
-                assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+                assert_eq!(frame.yuv.len(), 320 * 240 * 3 / 2);
                 frames += 1;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -155,7 +155,7 @@ async fn high_refresh_video_decodes_over_datagrams() {
             while received < 20 {
                 if let Some(frame) = client.take_frame() {
                     assert_eq!((frame.width, frame.height), (640, 360));
-                    assert_eq!(frame.rgba.len(), 640 * 360 * 4);
+                    assert_eq!(frame.yuv.len(), 640 * 360 * 3 / 2);
                     assert!(previous.is_none_or(|seq| frame.meta.seq > seq));
                     previous = Some(frame.meta.seq);
                     received += 1;
@@ -335,8 +335,8 @@ async fn native_desktop_gpu_cursor_audio_and_revocation() {
         while !(gpu && frames >= 5 && client.cursor().shape.is_some()) {
             while let Ok(event) = client_events.try_recv() {
                 match event {
-                    ClientEvent::VideoEncoder { name } => {
-                        println!("Native session encoder: {name}");
+                    ClientEvent::VideoEncoder { name, codec } => {
+                        println!("Native session encoder: {codec} · {name}");
                         gpu = name.starts_with("GPU:");
                     }
                     ClientEvent::Ended(reason) => panic!("native session ended: {reason}"),
@@ -418,10 +418,18 @@ struct Raw {
 }
 
 async fn raw_hello(host_ep: &Endpoint, version: u32) -> Raw {
+    raw_hello_decoding(host_ep, version, vec![CodecSupport::software(Codec::H264)]).await
+}
+
+/// A viewer's hello and, for a matching version, its decoder list.
+async fn raw_hello_decoding(host_ep: &Endpoint, version: u32, decoders: Vec<CodecSupport>) -> Raw {
     let ep = endpoint().await;
     let conn = timeout(WAIT, ep.connect(net::local_addr(host_ep), ALPN)).await.unwrap().unwrap();
     let (mut send, recv) = conn.open_bi().await.unwrap();
     net::write_msg(&mut send, &ClientMsg::Hello { version, client_name: "Raw".into() }).await.unwrap();
+    if version == connect_proto::PROTOCOL_VERSION {
+        net::write_msg(&mut send, &ClientMsg::Decoders(decoders)).await.unwrap();
+    }
     Raw { _ep: ep, conn, send, recv }
 }
 
@@ -440,6 +448,42 @@ async fn version_mismatch_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_viewer_without_a_common_codec_is_turned_away() {
+    let (host_ep, _host, _host_events) = start_host(config()).await;
+    let decoders = vec![CodecSupport::hardware(Codec::H265)];
+    let mut raw = raw_hello_decoding(&host_ep, connect_proto::PROTOCOL_VERSION, decoders).await;
+    match read_reply(&mut raw.recv).await {
+        Some(HostMsg::Rejected { reason }) => assert!(reason.contains("no video format in common"), "{reason}"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_chosen_codec_is_announced_and_carried_by_every_frame() {
+    let (host_ep, _host, mut host_events) = start_host(config()).await;
+    let decoders = vec![CodecSupport::hardware(Codec::H265), CodecSupport::software(Codec::H264)];
+    let Raw { _ep, conn, send: _send, mut recv } =
+        raw_hello_decoding(&host_ep, connect_proto::PROTOCOL_VERSION, decoders).await;
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
+    assert!(matches!(read_reply(&mut recv).await, Some(HostMsg::Welcome { .. })));
+    // The test pattern has no hardware encoder: software H.264, the only codec in common.
+    let announced = loop {
+        if let Some(HostMsg::VideoEncoder { codec, .. }) = read_reply(&mut recv).await {
+            break codec;
+        }
+    };
+    assert_eq!(announced, Codec::H264);
+    let mut asm = FrameAssembler::new();
+    let frame = loop {
+        asm.push(timeout(WAIT, conn.read_datagram()).await.unwrap().unwrap()).unwrap();
+        if let Some(frame) = asm.next_frame() {
+            break frame;
+        }
+    };
+    assert_eq!(frame.meta.codec, Codec::H264);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn keyframe_request_is_honoured() {
     let (host_ep, _host, mut host_events) = start_host(config()).await;
     let Raw { _ep, conn, mut send, mut recv } = raw_hello(&host_ep, connect_proto::PROTOCOL_VERSION).await;
@@ -449,7 +493,8 @@ async fn keyframe_request_is_honoured() {
     let mut asm = FrameAssembler::new();
     let mut next_frame = async || loop {
         let datagram = timeout(WAIT, conn.read_datagram()).await.unwrap().unwrap();
-        if let Some(frame) = asm.push(datagram).unwrap() {
+        asm.push(datagram).unwrap();
+        if let Some(frame) = asm.next_frame() {
             return frame;
         }
     };

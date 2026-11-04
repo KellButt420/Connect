@@ -10,10 +10,14 @@ bytes.workspace = true
 cpal.workspace = true
 connect-net.workspace = true
 connect-proto.workspace = true
+connect-gpu-load.workspace = true
+connect-perf.workspace = true
 iroh.workspace = true
 openh264.workspace = true
+opus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+openh264-sys2 = { version = "0.9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = "0.1.4"
@@ -30,6 +34,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

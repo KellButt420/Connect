@@ -3,10 +3,11 @@
 //! With no arguments this opens the app. The headless commands exist for testing without a display:
 //!
 //! ```text
-//! connect host [--test-pattern] [--print-input]
+//! connect host [--test-pattern[=WxH@FPS]] [--print-input] [--trace DIR]
 //!                                     share this PC (Windows); Allow/Deny is asked on the terminal
-//! connect join <USER-ID> [--seconds N]
+//! connect join <USER-ID> [--seconds N] [--trace DIR]
 //! connect id                          print this PC's User-ID
+//! connect gpu-check                   check what the graphics hardware offers, and test it
 //! ```
 //!
 //! Only Windows can host; other platforms can only connect. `--test-pattern` hosts a generated
@@ -18,7 +19,14 @@
 //! `start /wait connect.exe …` so the terminal waits for them.
 //!
 //! Set `CONNECT_CONFIG_DIR` to use a separate identity, e.g. to run two copies on one PC, and
-//! `CONNECT_RENDERER=glow` if the window stays blank (falls back from wgpu to plain OpenGL).
+//! `CONNECT_RENDERER=separate` to keep the window off the video decoder's graphics device.
+//! `CONNECT_TRACE=DIR` (or `--trace DIR`) writes each session's performance trace there as CSV;
+//! `CONNECT_TRACE=0` turns tracing off. See METRICS.md.
+//!
+//! Hosting, for comparisons: `CONNECT_GPU_CONVERT=video-processor` converts colours with the
+//! driver's video processor instead of Connect's shaders; `CONNECT_INTRA_REFRESH=0` goes back to
+//! periodic keyframes; `CONNECT_FRAME_BUFFER=<frames>` changes the encoder's buffer cap (0: the
+//! driver's default).
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -32,14 +40,15 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use connect_client::Stats;
 use connect_net as net;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::Targets, prelude::*};
 
 const USAGE: &str = "\
 usage: connect                        open the app
-       connect host [--test-pattern] [--print-input]
+       connect host [--test-pattern[=WxH@FPS]] [--print-input] [--trace DIR]
                                       share this PC from the terminal (Windows)
-       connect join <USER-ID> [--seconds N]
-       connect id                     print this PC's User-ID";
+       connect join <USER-ID> [--seconds N] [--trace DIR]
+       connect id                     print this PC's User-ID
+       connect gpu-check              check this PC's graphics hardware and save a report";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,9 +56,11 @@ fn main() -> Result<()> {
     if !args.is_empty() {
         attach_parent_console();
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,iroh=warn,noq=warn".into()))
-        .init();
+    // RUST_LOG as targets and levels only (e.g. "debug,iroh=info"): unlike a full EnvFilter, no
+    // regex engine, and spans below the level are never created.
+    let filter = std::env::var("RUST_LOG").ok().and_then(|value| value.parse::<Targets>().ok());
+    let filter = filter.unwrap_or_else(|| "info,iroh=warn,noq=warn".parse().expect("valid default filter"));
+    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).init();
     update::clean_up_previous();
 
     if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
@@ -61,7 +72,10 @@ fn main() -> Result<()> {
         Some(dir) => PathBuf::from(dir),
         None => net::default_config_dir()?,
     };
-    let runtime = tokio::runtime::Runtime::new()?;
+    // A few workers are plenty for the network and session tasks (video has threads of its own);
+    // one per core only costs memory on many-core PCs.
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build()?;
     // The app asks before creating an account; the terminal commands just make one.
     let key = || net::load_or_create_identity(&config_dir);
 
@@ -69,6 +83,7 @@ fn main() -> Result<()> {
         None => gui::run(runtime, config_dir),
         Some("host") => runtime.block_on(cli::host(key()?, &args[1..])),
         Some("join") => runtime.block_on(cli::join(key()?, &args[1..])),
+        Some("gpu-check") => cli::gpu_check(),
         Some("id") => {
             println!("{}", net::format_user_id(&key()?.public()));
             Ok(())
@@ -92,17 +107,144 @@ fn device_name() -> String {
     if name.is_empty() { "My PC".into() } else { name }
 }
 
-/// One line of session figures, for the terminal and the in-session overlay.
+/// Session figures for the terminal and the in-session overlay: the connection, how smoothly
+/// frames come, where the latency goes (percentiles, from the performance trace), input, and
+/// what each PC spends on it. METRICS.md says what each figure measures.
 pub(crate) fn stats_line(s: &Stats) -> String {
     let rtt = s.rtt.map_or("–".into(), |r| format!("{:.0} ms", r.as_secs_f32() * 1000.0));
-    let latency = s.latency_ms.map_or("–".into(), |l| format!("~{l:.0} ms"));
-    format!(
-        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s · latency {latency} (encode {:.1} / decode {:.1} ms) · lost {}",
+    let target = s.host_mbps.map_or(String::new(), |m| format!(" (target {m:.1})"));
+    let loss = s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}%", l * 100.0));
+    let mut text = format!(
+        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target}{loss}\nFrames lost {} · repaired {} · skipped {} · superseded {}",
         s.path.label(),
         s.fps,
         s.mbps,
-        s.encode_ms,
-        s.decode_ms,
         s.frames_lost,
-    )
+        s.frames_recovered,
+        s.frames_skipped,
+        s.frames_superseded,
+    );
+    let ms = |us: i64| format!("{:.1}", us as f64 / 1000.0);
+    let p50 = |p: Option<connect_client::Percentiles>| p.map_or("–".into(), |p| ms(p.p50));
+    if let Some(f) = &s.frames {
+        text += &format!(" · last second: dropped {}, repeated ~{}, keyframes {}", s.dropped, f.repeated, f.keyframes);
+        if let Some(bytes) = f.frame_bytes {
+            let kb = |b: i64| format!("{:.0}", b as f64 / 1000.0);
+            text += &format!(" · frame size p50 {} / p99 {} KB", kb(bytes.p50), kb(bytes.p99));
+        }
+        if let (Some(time), Some(interval)) = (f.frame_time, f.frame_interval) {
+            text += &format!(" · frame time {:.1} ± {:.1} ms (p99 {})", time.mean, time.stddev, ms(interval.p99));
+        }
+        let clock = s.clock.map_or(String::new(), |c| format!(", clocks ±{} ms", ms(c.uncertainty_us as i64)));
+        text += &match f.total {
+            Some(t) => format!(
+                "\nLatency to this window (est.{clock}): p50 {} · p95 {} · p99 {} · max {} ms",
+                ms(t.p50),
+                ms(t.p95),
+                ms(t.p99),
+                ms(t.max)
+            ),
+            None => "\nLatency to this window: measuring…".into(),
+        };
+        let host = s.host_perf;
+        let from_host =
+            |pick: fn(&connect_client::HostPerf) -> Option<connect_client::Percentiles>| host.as_ref().and_then(pick);
+        let send = match host {
+            Some(h) => format!(
+                "held {} · queue {} · packetize {} · send {}",
+                p50(h.held),
+                p50(h.queue),
+                p50(h.packetize),
+                p50(h.send)
+            ),
+            None => format!("send wait {}", p50(f.host_wait)),
+        };
+        text += &format!(
+            "\n  p50 host: screen→capture {} · capture {} · GPU convert {} · encode {} · {send} ms",
+            p50(f.present_to_capture),
+            p50(from_host(|h| h.capture).or(f.capture)),
+            p50(from_host(|h| h.convert_gpu)),
+            p50(from_host(|h| h.encode).or(f.encode)),
+        );
+        text += &format!(
+            "\n  p50 here: network {} (est.) · reassembly {} · decode queue {} · decode {} on {} · draw {} ms",
+            p50(f.network),
+            p50(f.reassembly),
+            p50(f.decode_queue),
+            p50(f.decode),
+            if s.gpu_decode { "GPU" } else { "CPU" },
+            p50(f.render),
+        );
+    } else if let Some(l) = &s.latency {
+        // Tracing is off: the running averages still work.
+        let ms = |v: f32| format!("{v:.1}");
+        let maybe = |v: Option<f32>| v.map_or("–".into(), ms);
+        let total = match (l.total, l.worst) {
+            (Some(total), Some(worst)) => format!("~{total:.0} ms (slowest {worst:.0})"),
+            _ => "measuring…".into(),
+        };
+        text += &format!(
+            "\nLatency to this window {total}: host screen→capture {} · capture {} · encode {} · send wait {} · \
+             network {} · reassembly {} · decode {} on {} · draw {} ms (averages)",
+            maybe(l.present_to_capture),
+            ms(l.capture),
+            ms(l.encode),
+            ms(l.host_wait),
+            maybe(l.network),
+            ms(l.reassembly),
+            ms(l.decode),
+            if s.gpu_decode { "GPU" } else { "CPU" },
+            ms(l.render),
+        );
+    }
+    let inject = s.host_perf.and_then(|h| h.input_inject);
+    if let Some(one_way) = s.input_one_way() {
+        text += &format!(
+            "\nInput to host (est.): p50 {} · p95 {} · p99 {} ms · injecting {} ms",
+            ms(one_way.p50),
+            ms(one_way.p95),
+            ms(one_way.p99),
+            p50(inject)
+        );
+    }
+    let process = |load: Option<connect_client::ProcessLoad>| {
+        load.map(|p| {
+            let share = p.cpu_percent / f32::from(p.cores.max(1));
+            format!("CPU {share:.1}% ({:.2} cores) · {:.0} MB", p.cpu_percent / 100.0, p.memory_bytes as f64 / 1e6)
+        })
+    };
+    let host_process = s.host_perf.and_then(|h| h.process);
+    if host_process.is_some() || s.process.is_some() {
+        let unknown = || "–".to_owned();
+        text += &format!(
+            "\nHost {} · here {}",
+            process(host_process).unwrap_or_else(unknown),
+            process(s.process).unwrap_or_else(unknown)
+        );
+    }
+    let gpu = |load: Option<connect_client::GpuLoad>| {
+        load.map(|g| {
+            let mut text = format!("{}% graphics", g.graphics);
+            if let Some(encode) = g.encode {
+                text += &format!(", {encode}% encoder");
+            }
+            if let Some(decode) = g.decode {
+                text += &format!(", {decode}% decoder");
+            }
+            text
+        })
+    };
+    if s.host_gpu.is_some() || s.gpu.is_some() {
+        let unknown = || "–".to_owned();
+        text += &format!(
+            "\nGPU load: host {} · here {}",
+            gpu(s.host_gpu).unwrap_or_else(unknown),
+            gpu(s.gpu).unwrap_or_else(unknown)
+        );
+    }
+    let dropped = s.trace_dropped + s.host_perf.map_or(0, |h| h.trace_dropped);
+    if dropped > 0 {
+        text += &format!("\n{dropped} trace records dropped (buffer busy)");
+    }
+    text
 }

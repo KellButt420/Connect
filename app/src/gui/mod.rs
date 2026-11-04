@@ -1,8 +1,9 @@
-//! The desktop app: first-run account setup, the Share / Connect / Settings pages, the
-//! Allow/Deny prompt, and the session view.
+//! The desktop app: first-run account setup, the Connect and Settings pages, the Allow/Deny
+//! prompt, and the session view.
 
 mod driver;
 mod gamepad;
+mod icons;
 mod input;
 mod pages;
 mod prompt;
@@ -10,6 +11,7 @@ mod session;
 mod settings;
 mod theme;
 mod updates;
+mod video;
 mod welcome;
 
 use std::{
@@ -24,7 +26,7 @@ use std::{
 
 use anyhow::Result;
 use connect_client::{ClientEvent, ClientHandle, Stage};
-use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle, VideoSource};
+use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle};
 use connect_net::{
     self as net,
     iroh::{Endpoint, EndpointId},
@@ -53,18 +55,41 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         Some(key) => Some(runtime.block_on(net::bind_endpoint(key))?),
         None => None,
     };
-    // wgpu (Direct3D 12 / Vulkan / Metal) normally; plain OpenGL for machines where that fails,
-    // such as old GPUs and some VMs.
-    let renderer = match std::env::var("CONNECT_RENDERER").as_deref() {
-        Ok("glow" | "opengl") => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
-    };
+    // Where hardware decoding is wanted and the graphics card decodes through Vulkan, the window
+    // renders with the decoder's own device, so decoded pictures go straight to the screen.
+    // Otherwise wgpu picks a device itself: Vulkan, or Direct3D 12 (Windows) or OpenGL where
+    // Vulkan is missing.
+    let shared_gpu = (Settings::saved().hardware_decoding
+        && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
+    .then(|| match connect_client::SharedGpu::open() {
+        Ok(gpu) => Some(gpu),
+        Err(e) => {
+            tracing::info!("the window draws on its own device: {e:#}");
+            None
+        }
+    })
+    .flatten();
+    let mut wgpu_options =
+        eframe::WgpuConfiguration::default().with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
+    if let Some(gpu) = &shared_gpu {
+        tracing::info!(gpu = gpu.name, "the window and the video decoder share the graphics card");
+        let (instance, adapter, device, queue) = gpu.wgpu();
+        wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::Existing(eframe::egui_wgpu::WgpuSetupExisting {
+            instance,
+            adapter,
+            device,
+            queue,
+        });
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Connect")
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0]),
-        renderer,
+        // One frame queued for the screen, not two: a refresh less of delay.
+        wgpu_options,
+        // Fonts for characters Inter lacks are looked up lazily instead (see `theme`).
+        system_font_fallback: false,
         ..Default::default()
     };
     let handle = runtime.handle().clone();
@@ -74,7 +99,13 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         options,
         Box::new({
             let restart = restart.clone();
-            |cc| Ok(Box::new(Root::new(cc, handle, config_dir, endpoint, restart)))
+            move |cc| {
+                // The window opened on the shared card: decoders hand it textures from now on.
+                if let (Some(gpu), Some(_)) = (&shared_gpu, &cc.wgpu_render_state) {
+                    gpu.install();
+                }
+                Ok(Box::new(Root::new(cc, handle, config_dir, endpoint, restart)))
+            }
         }),
     )
     .map_err(|e| anyhow::anyhow!("couldn't open the window: {e}"));
@@ -109,6 +140,7 @@ impl Root {
         restart: Restart,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
+        video::init(cc);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let screen = match endpoint {
             Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings, restart.clone()))),
@@ -149,7 +181,7 @@ impl eframe::App for Root {
     }
 
     /// The window is closing: end sessions so nothing is left held down or hanging.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if let Screen::Main(app) = &mut self.screen {
             app.shutdown(&self.runtime);
         }
@@ -158,9 +190,18 @@ impl eframe::App for Root {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Share,
+    /// This PC and the computers it can connect to.
     Connect,
     Settings,
+}
+
+/// A dialog over the pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    /// Typing in a new computer's User-ID.
+    AddComputer,
+    /// Who is using this PC, and what they may use.
+    Hosting,
 }
 
 pub struct App {
@@ -176,7 +217,17 @@ pub struct App {
     /// Who is using this PC right now.
     hosting: Option<Hosting>,
     page: Page,
+    /// When the current page was opened, for fading it in.
+    page_since: Instant,
+    dialog: Option<Dialog>,
+    /// The User-ID being typed into the Connect dialog.
     connect_input: String,
+    /// Put the cursor in that field on the next frame.
+    focus_input: bool,
+    /// The saved computer (by User-ID) whose card asks "Remove?".
+    confirm_remove: Option<String>,
+    /// Whether Settings shows this PC's User-ID rather than dots.
+    show_user_id: bool,
     client: Option<ClientSession>,
     /// The latest thing worth telling the user, such as why a session ended.
     notice: Option<Notice>,
@@ -201,7 +252,10 @@ struct Hosting {
 
 struct Notice {
     text: String,
+    /// The technical side of an error, shown only on request.
+    detail: Option<String>,
     is_error: bool,
+    shown: Instant,
 }
 
 /// This PC connecting to another one.
@@ -211,7 +265,9 @@ struct ClientSession {
     host_id: EndpointId,
     started: Instant,
     state: ClientState,
-    video: Option<egui::TextureHandle>,
+    video: video::VideoView,
+    /// The pointer position last sent to the host, and when.
+    pointer_sent: Option<((u16, u16, bool), Instant)>,
     host_cursor_texture: Option<(u64, egui::TextureHandle)>,
     encoder: String,
     audio_active: bool,
@@ -222,6 +278,8 @@ struct ClientSession {
     gamepads: Option<gamepad::Forwarder>,
     /// A short message over the video, e.g. that the host changed permissions.
     note: Option<(String, Instant)>,
+    /// What became of the last performance trace export, once it's done.
+    exported: Arc<Mutex<Option<String>>>,
 }
 
 impl ClientSession {
@@ -238,6 +296,9 @@ enum ClientState {
 
 impl App {
     fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings, restart: Restart) -> Self {
+        connect_client::set_hardware_decoding(settings.hardware_decoding);
+        connect_client::set_smooth_pacing(settings.smooth_pacing);
+        connect_client::set_allow_h265(settings.allow_h265);
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
             let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());
@@ -268,9 +329,13 @@ impl App {
             gamepad_driver: driver::GamepadDriver::new(),
             requests: VecDeque::new(),
             hosting: None,
-            // Only Windows can host; elsewhere the host just turns callers away with the reason.
-            page: if VideoSource::SCREEN_SUPPORTED { Page::Share } else { Page::Connect },
+            page: Page::Connect,
+            page_since: Instant::now(),
+            dialog: None,
             connect_input: String::new(),
+            focus_input: false,
+            confirm_remove: None,
+            show_user_id: false,
             client: None,
             notice: None,
             updater: updates::Updater::new(ctx),
@@ -292,7 +357,7 @@ impl App {
     }
 
     fn notify(&mut self, text: impl Into<String>, is_error: bool) {
-        self.notice = Some(Notice { text: text.into(), is_error });
+        self.notice = Some(Notice { text: text.into(), detail: None, is_error, shown: Instant::now() });
     }
 
     fn on_host_event(&mut self, event: HostEvent) {
@@ -328,7 +393,8 @@ impl App {
             host_id,
             started: Instant::now(),
             state: ClientState::Connecting,
-            video: None,
+            video: Default::default(),
+            pointer_sent: None,
             host_cursor_texture: None,
             encoder: "Starting encoder…".into(),
             audio_active: false,
@@ -338,6 +404,7 @@ impl App {
             input: input::InputCapture::default(),
             gamepads: None,
             note: None,
+            exported: Default::default(),
         });
         self.notice = None;
     }
@@ -350,7 +417,9 @@ impl App {
                 ClientEvent::Stage(Stage::Connecting) => client.state = ClientState::Connecting,
                 ClientEvent::Stage(Stage::WaitingForApproval) => client.state = ClientState::WaitingForApproval,
                 ClientEvent::Accepted { host_name, permissions, .. } => {
-                    self.settings.add_recent(client.host_id, &host_name);
+                    self.settings.remember_computer(client.host_id, &host_name);
+                    self.dialog = None;
+                    self.connect_input.clear();
                     client.note(format!("Connected. You can use: {}.", describe(permissions)), 5);
                     client.state = ClientState::Connected { host_name, permissions };
                     client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone()));
@@ -368,7 +437,7 @@ impl App {
                     }
                 }
                 ClientEvent::InputUnavailable { reason, .. } => client.note(reason, 10),
-                ClientEvent::VideoEncoder { name } => client.encoder = name,
+                ClientEvent::VideoEncoder { name, codec } => client.encoder = format!("{codec} · {name}"),
                 ClientEvent::AudioStatus { active, reason } => {
                     client.audio_active = active;
                     if let Some(reason) = reason {
@@ -384,7 +453,8 @@ impl App {
             let is_error = !matches!(reason, connect_client::EndReason::Disconnected);
             self.client = None;
             self.page = Page::Connect;
-            self.notify(reason.to_string(), is_error);
+            let (text, detail) = explain(&reason);
+            self.notice = Some(Notice { text, detail, is_error, shown: Instant::now() });
             if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
             }
@@ -423,21 +493,44 @@ impl App {
         if self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. })) {
             session::show(self, ui);
         } else {
-            egui::Panel::left("nav").exact_size(210.0).resizable(false).frame(theme::sidebar()).show(ui, |ui| {
-                pages::nav(self, ui);
-            });
+            let area = ui.max_rect();
+            theme::backdrop(ui.painter(), area);
+            let content = pages::sidebar(self, ui, area);
+            let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
             let in_session = self.hosting.is_some() || self.client.is_some();
-            egui::CentralPanel::default().frame(theme::content()).show(ui, |ui| {
-                self.updater.banner(ui, in_session);
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.page {
-                    Page::Share => pages::share(self, ui),
-                    Page::Connect => pages::connect(self, ui),
-                    Page::Settings => pages::settings(self, ui),
-                });
+            self.updater.banner(&mut ui, in_session);
+            egui::ScrollArea::vertical().auto_shrink(false).show(&mut ui, |ui| {
+                // Room on the right for the scroll bar, which floats over the content.
+                egui::Frame::new().inner_margin(egui::Margin { right: 14, bottom: 24, ..Default::default() }).show(
+                    ui,
+                    |ui| {
+                        theme::fade_in(ui, self.page_since);
+                        match self.page {
+                            Page::Connect => pages::computers(self, ui),
+                            Page::Settings => pages::settings(self, ui),
+                        }
+                    },
+                );
             });
+            pages::dialogs(self, ui.ctx());
         }
         prompt::show(self, ui.ctx());
     }
+}
+
+/// Why a connection ended, in words for people: for a failure, its outermost reason up front and
+/// the error chain beneath it as detail.
+fn explain(reason: &connect_client::EndReason) -> (String, Option<String>) {
+    let connect_client::EndReason::Failed(error) = reason else { return (reason.to_string(), None) };
+    let (head, detail) = match error.split_once(": ") {
+        Some((head, rest)) => (head, Some(rest.to_owned())),
+        None => (error.as_str(), None),
+    };
+    let mut text: String = head.chars().take(1).flat_map(char::to_uppercase).chain(head.chars().skip(1)).collect();
+    if !text.ends_with(['.', '?', '!']) {
+        text.push('.');
+    }
+    (text, detail)
 }
 
 /// "mouse, keyboard and gamepad", or "only the screen (view only)".
@@ -481,4 +574,29 @@ fn forward_host_events(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use connect_client::EndReason;
+
+    use super::explain;
+
+    #[test]
+    fn failures_lead_with_the_reason_and_keep_the_chain_as_detail() {
+        let failed = EndReason::Failed(
+            "couldn't reach that User-ID. Is Connect running on the host?: No addressing information available: \
+             lookup failed"
+                .into(),
+        );
+        let (text, detail) = explain(&failed);
+        assert_eq!(text, "Couldn't reach that User-ID. Is Connect running on the host?");
+        assert_eq!(detail.as_deref(), Some("No addressing information available: lookup failed"));
+
+        let (text, detail) = explain(&EndReason::Failed("the host didn't answer".into()));
+        assert_eq!((text.as_str(), detail), ("The host didn't answer.", None));
+
+        let (text, detail) = explain(&EndReason::Rejected("The host denied the connection.".into()));
+        assert_eq!((text.as_str(), detail), ("The host denied the connection.", None));
+    }
 }

@@ -47,7 +47,31 @@ pub enum InputEvent {
     GamepadRemoved { pad: u8 },
 }
 
+/// What the input stream carries: each event numbered and stamped when the viewer sent it, so
+/// the time it takes to reach the host can be measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedInput {
+    /// Counts up from 0 through the session.
+    pub seq: u32,
+    /// When the viewer sent it, on the viewer's clock ([`crate::now_micros`]).
+    pub client_time_us: u64,
+    pub event: InputEvent,
+}
+
 impl InputEvent {
+    /// A short name for the kind of event, for trace files.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            InputEvent::MouseMoveTo { .. } => "mouse_move_to",
+            InputEvent::MouseMoveBy { .. } => "mouse_move_by",
+            InputEvent::MouseButton { .. } => "mouse_button",
+            InputEvent::MouseWheel { .. } => "mouse_wheel",
+            InputEvent::Key { .. } => "key",
+            InputEvent::Gamepad { .. } => "gamepad",
+            InputEvent::GamepadRemoved { .. } => "gamepad_removed",
+        }
+    }
+
     /// The permission that must be on for the host to act on this event.
     pub const fn device(&self) -> DeviceClass {
         match self {

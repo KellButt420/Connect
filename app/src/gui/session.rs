@@ -1,8 +1,8 @@
-//! Remote desktop, independent cursor updates, and an opaque left-side shelf.
+//! Remote desktop, independent cursor updates, and the glass shelf of session controls on the left.
 use super::{
-    App, ClientSession, ClientState,
+    App, ClientSession, ClientState, icons,
     input::{Hotkey, normalise},
-    theme,
+    theme::{self, Glass},
 };
 use crate::stats_line;
 use connect_proto::DeviceClass;
@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 const SHELF_WIDTH: f32 = 180.0;
 const SHELF_HEIGHT: f32 = 362.0;
 const RECENTRE_MARGIN: f32 = 80.0;
+/// An unmoved pointer is reported again this often; the host hides it after a second without.
+const POINTER_REPEAT: Duration = Duration::from_millis(250);
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
@@ -20,10 +22,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let (host_name, permissions) = (host_name.clone(), *permissions);
     let area = ui.max_rect();
     let frame = client.handle.take_frame();
-    let image_size = frame
-        .as_ref()
-        .map(|f| egui::vec2(f.width as f32, f.height as f32))
-        .or_else(|| client.video.as_ref().map(|t| t.size_vec2()));
+    // A frame held back for smooth pacing: look again when it's due.
+    if let Some(due) = client.handle.next_frame_due() {
+        ctx.request_repaint_after(due);
+    }
+    let image_size =
+        frame.as_ref().map(|f| egui::vec2(f.width as f32, f.height as f32)).or_else(|| client.video.size());
     let video_rect = image_size.map_or(area, |size| fit(size, area));
     let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
     let (events, focused, pointer) = ctx.input(|i| (i.events.clone(), i.focused, i.pointer.hover_pos()));
@@ -35,6 +39,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         match hotkey {
             Hotkey::Fullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen)),
             Hotkey::Stats => client.show_stats = !client.show_stats,
+            Hotkey::ExportTrace => export_trace(&ctx, client),
             Hotkey::MouseCapture => {
                 let capture = !client.input.captured && permissions.allows(DeviceClass::Mouse);
                 set_captured(&ctx, client, capture);
@@ -55,24 +60,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         focused && !client.input.captured && video_rect.contains(*p) && !blocked.is_some_and(|rect| rect.contains(*p))
     });
     let (x, y) = remote_pointer.map_or((0, 0), |p| normalise(p, video_rect));
-    client.handle.send_cursor(x, y, remote_pointer.is_some());
-    ctx.request_repaint_after(Duration::from_millis(250));
+    send_pointer(client, (x, y, remote_pointer.is_some()));
+    ctx.request_repaint_after(POINTER_REPEAT);
     if let Some(frame) = frame {
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
-        match &mut client.video {
-            Some(texture) => texture.set(image, TextureOptions::LINEAR),
-            None => client.video = Some(ctx.load_texture("remote-screen", image, TextureOptions::LINEAR)),
-        }
+        client.video.set_frame(&ctx, frame);
     }
+    client.video.recycle(&client.handle);
     ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-    if let Some(texture) = &client.video {
-        ui.painter().image(
-            texture.id(),
-            video_rect,
-            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+    if client.video.size().is_some() {
+        client.video.paint(ui.painter(), video_rect);
     } else {
         ui.painter().text(
             area.center(),
@@ -89,13 +85,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             stats_line(&client.handle.stats()),
             egui::FontId::monospace(12.0),
             Color32::WHITE,
-            area.width() - 36.0,
+            area.width() - 48.0,
         );
-        let rect =
-            Rect::from_min_size(egui::pos2(area.left() + 12.0, area.bottom() - galley.size().y - 20.0), galley.size())
-                .expand(6.0);
-        ui.painter().rect_filled(rect, 6.0, Color32::from_rgb(24, 26, 34));
-        ui.painter().galley(rect.min + egui::vec2(6.0, 6.0), galley, Color32::WHITE);
+        let rect = Rect::from_min_size(
+            egui::pos2(area.left() + 16.0, area.bottom() - galley.size().y - 26.0),
+            galley.size() + egui::vec2(20.0, 14.0),
+        );
+        ui.painter().add(Glass::OVERLAY.shapes(rect, 12.0));
+        ui.painter().galley(rect.min + egui::vec2(10.0, 7.0), galley, Color32::WHITE);
+    }
+    let exported = client.exported.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(result) = exported {
+        client.note(result, 8);
     }
     if let Some((text, until)) = &client.note {
         if Instant::now() < *until {
@@ -106,11 +107,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 (area.width() - 48.0).min(560.0),
             );
             let rect = Rect::from_center_size(
-                egui::pos2(area.center().x, area.top() + 20.0 + galley.size().y / 2.0),
-                galley.size() + egui::vec2(24.0, 16.0),
+                egui::pos2(area.center().x, area.top() + 24.0 + galley.size().y / 2.0),
+                galley.size() + egui::vec2(32.0, 18.0),
             );
-            ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(24, 26, 34));
-            ui.painter().galley(rect.min + egui::vec2(12.0, 8.0), galley, Color32::WHITE);
+            ui.painter().add(Glass::OVERLAY.shapes(rect, rect.height().min(40.0) / 2.0));
+            ui.painter().galley(rect.min + egui::vec2(16.0, 9.0), galley, Color32::WHITE);
         } else {
             client.note = None;
         }
@@ -118,69 +119,129 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if client.input.captured {
         return;
     }
-    if !client.shelf_open {
+    // The shelf slides in from the left edge; shut, a small handle is left to open it again.
+    let open = ctx.animate_bool_with_time_and_easing(
+        egui::Id::unique("session-shelf"),
+        client.shelf_open,
+        0.22,
+        egui::emath::easing::cubic_out,
+    );
+    if open < 1.0 {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(handle));
-        if child
-            .add_sized(handle.size(), egui::Button::new("›").fill(Color32::from_rgb(24, 26, 34)))
-            .on_hover_text("Open session controls")
-            .clicked()
-        {
+        child.multiply_opacity(1.0 - open);
+        let response = child.interact(handle, egui::Id::unique("shelf-handle"), Sense::click());
+        let hover = ctx.animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+        let glass = Glass::OVERLAY
+            .lerp(&Glass { base: Color32::from_rgba_premultiplied(30, 32, 48, 230), ..Glass::OVERLAY }, hover);
+        child.painter().add(glass.shapes(handle, 12.0));
+        child.painter().text(
+            handle.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::CARET_RIGHT,
+            theme::icon_font(16.0),
+            theme::TEXT,
+        );
+        if response.on_hover_text("Open session controls").clicked() {
             client.shelf_open = true;
         }
+    }
+    if open <= 0.0 {
         return;
     }
-    ui.painter().rect_filled(shelf, 12.0, Color32::from_rgb(24, 26, 34));
+    let shelf = shelf.translate(egui::vec2(-(1.0 - open) * (SHELF_WIDTH + 16.0), 0.0));
     let mut controls = ui.new_child(egui::UiBuilder::new().max_rect(shelf.shrink(12.0)));
-    controls.spacing_mut().item_spacing.y = 6.0;
+    controls.multiply_opacity(open);
+    controls.painter().add(Glass::OVERLAY.shapes(shelf, 18.0));
+    controls.spacing_mut().item_spacing.y = 4.0;
     controls.horizontal(|ui| {
-        ui.label(RichText::new("Session").strong());
-        if ui.button("‹").on_hover_text("Collapse controls").clicked() {
-            client.shelf_open = false;
-        }
+        ui.label(theme::caption("SESSION").size(11.0).extra_letter_spacing(0.8));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::icon_button(ui, icons::CARET_LEFT, 24.0).on_hover_text("Hide controls").clicked() {
+                client.shelf_open = false;
+            }
+        });
     });
-    controls.add(egui::Label::new(RichText::new(&host_name).strong().size(14.0)).truncate()).on_hover_text(&host_name);
-    controls.label(RichText::new(client.handle.stats().path.label()).color(theme::ACCENT).size(12.0));
     controls
-        .add(egui::Label::new(RichText::new(&client.encoder).weak().size(11.0)).truncate())
+        .add(egui::Label::new(RichText::new(&host_name).font(theme::semibold(15.0))).truncate())
+        .on_hover_text(&host_name);
+    controls.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        theme::dot(ui, theme::ACCENT);
+        ui.label(RichText::new(client.handle.stats().path.label()).color(theme::ACCENT).size(12.0));
+    });
+    controls
+        .add(egui::Label::new(theme::caption(&client.encoder).size(11.0)).truncate())
         .on_hover_text(&client.encoder);
-    controls.separator();
-    let size = egui::vec2(SHELF_WIDTH - 24.0, 29.0);
-    let label = if fullscreen { "Exit fullscreen" } else { "Enter fullscreen" };
-    if controls.add_sized(size, egui::Button::new(label)).on_hover_text("Ctrl+Alt+F").clicked() {
+    let decoder = client.handle.decoder();
+    if !decoder.is_empty() {
+        controls.add(egui::Label::new(theme::caption(&decoder).size(11.0)).truncate()).on_hover_text(&decoder);
+    }
+    controls.add_space(4.0);
+    divider(&mut controls);
+    let (icon, label) =
+        if fullscreen { (icons::ARROWS_IN, "Exit fullscreen") } else { (icons::ARROWS_OUT, "Enter fullscreen") };
+    if shelf_button(&mut controls, icon, label, true).on_hover_text("Ctrl+Alt+F").clicked() {
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
     }
-    let capture = controls
-        .add_enabled_ui(permissions.allows(DeviceClass::Mouse), |ui| {
-            ui.add_sized(size, egui::Button::new("Capture mouse")).on_hover_text("Ctrl+Alt+M releases the mouse")
-        })
-        .inner
-        .clicked();
-    let audio_label = if client.audio_muted { "Unmute audio" } else { "Mute audio" };
-    if controls
-        .add_enabled_ui(client.audio_active, |ui| ui.add_sized(size, egui::Button::new(audio_label)))
-        .inner
-        .clicked()
-    {
+    let capture =
+        shelf_button(&mut controls, icons::CURSOR_CLICK, "Capture mouse", permissions.allows(DeviceClass::Mouse))
+            .on_hover_text("Ctrl+Alt+M releases the mouse")
+            .clicked();
+    let (icon, label) =
+        if client.audio_muted { (icons::SPEAKER_SLASH, "Unmute audio") } else { (icons::SPEAKER_HIGH, "Mute audio") };
+    if shelf_button(&mut controls, icon, label, client.audio_active).clicked() {
         client.audio_muted = !client.audio_muted;
         client.handle.set_audio_muted(client.audio_muted);
     }
-    if controls
-        .add_sized(size, egui::Button::new(if client.show_stats { "Hide stats" } else { "Show stats" }))
-        .on_hover_text("Ctrl+Alt+S")
-        .clicked()
-    {
+    let label = if client.show_stats { "Hide stats" } else { "Show stats" };
+    if shelf_button(&mut controls, icons::CHART_LINE, label, true).on_hover_text("Ctrl+Alt+S").clicked() {
         client.show_stats = !client.show_stats;
     }
-    controls.separator();
-    if controls.add_sized(size, theme::primary("Disconnect")).clicked() {
+    divider(&mut controls);
+    controls.add_space(2.0);
+    let width = controls.available_width();
+    if controls.add(theme::danger("Disconnect").icon(icons::SIGN_OUT).small().width(width)).clicked() {
         client.handle.disconnect();
     }
     if !permissions.allows(DeviceClass::Audio) {
-        controls.label(RichText::new("Host audio is off").weak().size(11.0));
+        controls.label(theme::caption("Host audio is off").size(11.0));
     }
     if capture {
         set_captured(&ctx, client, true);
     }
+}
+
+/// A full-width row in the shelf: an icon and what it does.
+fn shelf_button(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> egui::Response {
+    let size = egui::vec2(ui.available_width(), 30.0);
+    let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("hover"), enabled && response.hovered(), 0.12);
+    if hover > 0.0 {
+        ui.painter().rect_filled(rect, 9.0, Color32::from_white_alpha((24.0 * hover) as u8));
+    }
+    let color = if enabled { theme::TEXT } else { theme::TEXT.gamma_multiply(0.35) };
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center() + egui::vec2(16.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        theme::icon_font(16.0),
+        color,
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(34.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::medium(13.0),
+        color,
+    );
+    response
+}
+
+fn divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, Color32::from_white_alpha(22)));
 }
 
 fn draw_host_cursor(client: &mut ClientSession, ui: &egui::Ui, video: Rect, image_size: Option<egui::Vec2>) {
@@ -215,6 +276,16 @@ fn draw_host_cursor(client: &mut ClientSession, ui: &egui::Ui, video: Rect, imag
     }
 }
 
+/// Tells the host where this user's pointer is over the picture, when it moved, and now and then
+/// regardless so the host knows it's still current.
+fn send_pointer(client: &mut ClientSession, position: (u16, u16, bool)) {
+    if client.pointer_sent.is_some_and(|(sent, at)| sent == position && at.elapsed() < POINTER_REPEAT) {
+        return;
+    }
+    client.pointer_sent = Some((position, Instant::now()));
+    client.handle.send_cursor(position.0, position.1, position.2);
+}
+
 pub(super) fn set_captured(ctx: &egui::Context, client: &mut ClientSession, captured: bool) {
     if client.input.captured == captured {
         return;
@@ -223,7 +294,7 @@ pub(super) fn set_captured(ctx: &egui::Context, client: &mut ClientSession, capt
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(if captured { CursorGrab::Confined } else { CursorGrab::None }));
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!captured));
     if captured {
-        client.handle.send_cursor(0, 0, false);
+        send_pointer(client, (0, 0, false));
         client.note("Mouse captured. Ctrl+Alt+M releases it.", 4);
     }
 }
@@ -237,6 +308,31 @@ fn shelf_rect(area: Rect) -> Rect {
 
 fn fit(size: egui::Vec2, area: Rect) -> Rect {
     Rect::from_center_size(area.center(), size * (area.width() / size.x).min(area.height() / size.y))
+}
+
+/// Saves the session's performance trace as CSV, off the UI thread, and says where when it's
+/// done: in the trace directory if one is set (`CONNECT_TRACE`), otherwise in `connect-traces`
+/// next to where the app was started, like `gpu-check`'s report.
+fn export_trace(ctx: &egui::Context, client: &mut ClientSession) {
+    let dir = connect_perf::trace_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).join("connect-traces"));
+    client.note("Saving the performance trace…", 2);
+    let (handle, result, ctx) = (client.handle.clone(), client.exported.clone(), ctx.clone());
+    let spawned = std::thread::Builder::new().name("connect-trace-export".into()).spawn(move || {
+        let fallback = std::env::temp_dir().join("connect-traces");
+        let text = match handle.export_trace(&dir).or_else(|_| handle.export_trace(&fallback)) {
+            Ok(files) => {
+                let folder = files.first().and_then(|f| f.parent()).map_or(dir, std::path::Path::to_path_buf);
+                format!("Performance trace saved to {}", folder.display())
+            }
+            Err(error) => format!("Couldn't save the performance trace: {error}"),
+        };
+        *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
+        ctx.request_repaint();
+    });
+    if let Err(error) = spawned {
+        client.note(format!("Couldn't save the performance trace: {error}"), 6);
+    }
 }
 
 #[cfg(test)]
@@ -276,7 +372,7 @@ mod tests {
                 }
                 if let Some(client) = &mut self.app.client {
                     client.note = None;
-                    if client.video.is_some()
+                    if client.video.size().is_some()
                         && !self.screenshot_requested
                         && client.started.elapsed() > Duration::from_secs(1)
                     {
@@ -314,7 +410,7 @@ mod tests {
             fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
                 self.app.ui(ui);
             }
-            fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+            fn on_exit(&mut self) {
                 if let Some(client) = &self.app.client {
                     client.handle.disconnect();
                 }
@@ -369,7 +465,8 @@ mod tests {
                     host_id: host_ep.id(),
                     started: Instant::now(),
                     state: ClientState::Connecting,
-                    video: None,
+                    video: Default::default(),
+                    pointer_sent: None,
                     host_cursor_texture: None,
                     encoder: "Starting encoder…".into(),
                     audio_active: false,
@@ -379,6 +476,7 @@ mod tests {
                     input: Default::default(),
                     gamepads: None,
                     note: None,
+                    exported: Default::default(),
                 });
                 Ok(Box::new(Probe {
                     app,

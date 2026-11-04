@@ -10,11 +10,25 @@ connect-client.workspace = true
 connect-host.workspace = true
 connect-net.workspace = true
 connect-proto.workspace = true
-eframe = { version = "0.37", features = ["persistence", "glow"] }
+connect-perf.workspace = true
+# Without eframe's OpenGL renderer (wgpu falls back to OpenGL itself on Linux) or its start-up
+# scan of every system font (done lazily instead, see gui::theme).
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "links",
+    "persistence",
+    "wayland",
+    "wgpu_no_default_features",
+    "x11",
+] }
+egui_system_font_provider = "0.37"
 gethostname = "1"
 gilrs = "0.11.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ron = "0.12"
 sha2 = "0.11"
 serde.workspace = true
 tokio.workspace = true
@@ -27,3 +41,4 @@ windows = { version = "0.62", features = ["Win32_System_Console"] }
 [dev-dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+naga = { version = "30.0.1", features = ["wgsl-in"] }

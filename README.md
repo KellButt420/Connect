@@ -1,9 +1,25 @@
 # Connect
 
-Performance fork of [volsatl9/Connect](https://github.com/volsatl9/Connect), with desktop audio,
-automatic GPU encoding, two-way cursor visibility, and compact session controls.
-Version 0.3 uses protocol 3: **update both PCs**. Older peers receive a version mismatch message.
-See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
+Version 0.9.0 keeps frames even. Hosts no longer send a full keyframe every 600 frames; where the
+graphics card's encoder offers it, the picture is renewed a band at a time (intra refresh). The
+encoder's buffer is capped at about two frames, so no single frame becomes a burst. The host's
+colour conversion now runs as two small shaders, whose GPU time shows in the stats. It works with
+0.8 viewers (protocol 8).
+
+Version 0.8.0 measures. Every frame is traced from the host's screen to the viewer's window,
+and every input event from the viewer to the host. The stats overlay (Ctrl+Alt+S) shows
+p50/p95/p99 latency, frame-time spread, dropped and repeated frames, and each PC's CPU and
+memory use. Ctrl+Alt+E saves the trace as CSV for analysis. [METRICS.md](METRICS.md) explains
+every figure and its limits. Its protocol is 8, so both PCs need 0.8.0.
+
+Version 0.7.0 draws hardware-decoded video straight from the graphics card, shows where every
+millisecond of latency goes and how busy each graphics card is (Ctrl+Alt+S), and adds a
+**Smooth** frame pacing option. Video uses H.265 in hardware when both PCs' graphics cards handle
+it (sharper at the same bandwidth), and H.264 otherwise. Since 0.6.0 the host keeps the screen on its graphics card from capture to
+encoder, and the two PCs agree on a codec from what each one's hardware can do. Its protocol is
+7, so both PCs need 0.7.0; older peers receive a version mismatch message. See [CODECS.md](CODECS.md) for how codecs are chosen and the plans for
+H.265 and AV1. See [performance notes](PERFORMANCE.md) for measurements
+and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
 Account** to get a User-ID. Give it to someone and they can connect to your PC from anywhere:
@@ -15,8 +31,8 @@ each permission on or off at any time.
 
 | | |
 |---|---|
-| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio with viewer mute, automatic hardware H.264 with CPU fallback, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
-| Not yet | Monitor selection, microphone sharing, GPU-only capture/conversion, hardware video decoding |
+| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 and H.265 encoding and decoding with CPU fallback, a GPU-only capture → encode path on the host, codec negotiation, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
+| Not yet | Monitor selection, microphone sharing, AV1 (planned, see [CODECS.md](CODECS.md)) |
 | Platforms | Windows can host and connect. Linux can connect only |
 
 ## Download
@@ -25,15 +41,32 @@ Grab the latest build from [Releases](../../releases):
 
 - `connect.exe`: Windows 10 / 11. It's unsigned, so SmartScreen asks first: **More info → Run anyway**.
   Allow it through the firewall so direct connections work.
-- This fork currently publishes a Windows build. Linux can be built from source; the upstream
-  project also publishes Linux builds.
+- `connect-linux-x86_64`: Linux with glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13 or newer).
+
+Desktop audio playback on Linux is not yet verified.
 
 Connect updates itself: when a new release is out it shows **Update available**, and **Update now**
 downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
 checks on demand.
 
+## Using it
+
+The **Connect** page shows this PC and every computer you've connected to as cards:
+
+- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While
+  someone is connected it says so, and **Manage** changes what they may use or disconnects them.
+- Each saved computer has its owner's name for it and a **Connect** button. A computer is saved
+  the first time it lets you in, and its name follows the owner's if they rename it. Hover a card
+  and click **✕** to remove it.
+- **+ Connect** asks for a User-ID, for a computer you haven't connected to before.
+
+**Settings** has your User-ID, hidden until you click **Show** so it doesn't end up on stream or in
+a screenshot (**Copy** works either way), this PC's name, what people may use by default, the
+devices that connect without asking, stream quality and updates. The arrow at the top of the
+sidebar collapses it to icons; click the logo to open it again.
+
 Gamepads work on the host through the ViGEmBus driver, which is built into `connect.exe`. The
-welcome screen offers to set it up, and so does the Share page. Windows asks for permission once.
+welcome screen offers to set it up, and so does Settings → Sharing. Windows asks for permission once.
 The remote user's controller shows up as an Xbox 360 controller in the next free slot: player 2
 if the host has one plugged in, player 1 if not. The driver stays installed if Connect is deleted;
 remove it under Windows *Installed apps* ("ViGEm Bus Driver").
@@ -46,18 +79,39 @@ programs, run Connect as administrator on the host.
 
 ## While connected
 
-The opaque shelf on the left contains fullscreen, mouse capture, audio mute, stats and
+The glass shelf on the left contains fullscreen, mouse capture, audio mute, stats and
 disconnect controls. Collapse it with the arrow; shortcuts remain available while the mouse
 is captured. The shelf's clicks stay local.
 
-Windows hosts automatically try a Media Foundation hardware H.264 encoder and fall back to
-parallel OpenH264 if initialization or encoding fails. The shelf reports the actual encoder.
-High-refresh sources are supported up to 240 Hz, subject to capture, encoder, network, decoder
-and display throughput; this does not guarantee 240 decoded frames per second.
+Windows hosts keep each captured frame on the graphics card: Direct3D 11's video processor
+converts it to NV12 there, and a Media Foundation hardware H.264 encoder reads it straight from
+the GPU. Where that isn't available, frames go through memory to the hardware encoder, and to
+parallel OpenH264 if initialization or encoding fails (or if Media Foundation is missing, as on
+Windows "N" editions). The two PCs pick the codec together, preferring one both graphics cards
+handle. The viewer decodes on its graphics card through Vulkan Video where the
+driver supports H.264 decoding (current NVIDIA, AMD and Intel drivers on Windows, and NVIDIA's
+driver or a recent Mesa on Linux), and on the processor with OpenH264 otherwise, or if Settings → Viewing →
+**Hardware video decoding** is off. The shelf shows the actual encoder and decoder, and the stats
+say whether decoding runs on the GPU or CPU. The stream follows the host
+monitor's refresh rate, up to 240 Hz, subject to capture, encoder, network, decoder and display
+throughput.
 
-Desktop audio uses uncompressed floating-point PCM, preferably the Windows engine's 48 kHz
-stereo mix (about 3.1 Mbps before transport). There is no lossy audio codec; Windows may downmix
-or resample the output device. No microphone is recorded. The host must allow **Desktop audio**;
+Video is built to keep moving on real internet connections:
+
+- Every frame carries a few recovery packets, so a lost packet or two (or a short burst) is
+  rebuilt on arrival instead of freezing the picture until a new keyframe. More are sent when
+  the connection is losing more.
+- Packets arriving out of order are put back in order rather than counted as lost.
+- The host lowers the bitrate the moment packets start queueing up, and raises it back towards
+  your setting once the connection keeps up; it never builds up seconds of delay.
+- The viewer decodes every frame but only displays the newest, and converts it to colour on the
+  graphics card, so a busy moment doesn't make it fall behind.
+
+Desktop audio is the Windows engine's 48 kHz stereo mix, compressed with Opus in 5 ms packets
+at 128 kb/s (uncompressed PCM was about 3.1 Mb/s). Opus's low-delay mode adds 2.5 ms, and the
+viewer fills a short run of lost packets (up to 20 ms) with Opus's concealment, not silence. If the
+output device can't give a 48 kHz stereo mix, audio is sent in its own format: Opus where that
+format allows, otherwise PCM. Windows may downmix or resample the output device. No microphone is recorded. The host must allow **Desktop audio**;
 existing saved permission sets leave it off until enabled. Missing audio devices leave video
 and input working. The viewer can mute playback independently.
 
@@ -71,7 +125,8 @@ from capture, the overlay is hidden to prevent duplicate pointers.
 |---|---|
 | Ctrl+Alt+M | Capture the mouse for games (raw movement, hidden pointer), and release it again |
 | Ctrl+Alt+F | Full screen |
-| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate, latency |
+| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), packet loss; frames lost / repaired / skipped / superseded, dropped and repeated in the last second, frame-time spread; latency from the host's screen to this window (p50/p95/p99) and stage by stage; input latency to the host; each PC's CPU, memory and graphics-card load. See [METRICS.md](METRICS.md) |
+| Ctrl+Alt+E | Save the session's performance trace as CSV (see [METRICS.md](METRICS.md)) |
 
 All other keys, including F-keys and Esc, go to the host.
 
@@ -106,18 +161,29 @@ gamepad transitions are preserved. Network and display latency still apply. See
 For testing without a display:
 
 ```text
-connect host [--test-pattern] [--print-input]
+connect host [--test-pattern[=WxH@FPS]] [--print-input]
                                     share this PC (Windows); Allow/Deny is asked on the terminal
 connect join <USER-ID> [--seconds N]
 connect id                          print this PC's User-ID
+connect gpu-check                   check the graphics hardware for sharing and viewing,
+                                    and save the report to connect-gpu-check.txt
 ```
 
-`--test-pattern` shares a generated image and `--print-input` prints the remote input instead of
-acting on it, both for development. On Windows the app has no console window, so start these as
+`--test-pattern` shares a generated image (1280×720 at 60 fps, or e.g. `--test-pattern=1920x1080@144`)
+and `--print-input` prints the remote input instead of acting on it, both for development. On Windows the app has no console window, so start these as
 `start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
-copies on one PC.
+copies on one PC. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
+keeping them on the graphics card, for comparison.
 
 ## Third-party components
 
 `connect.exe` includes the installer for [ViGEmBus](https://github.com/nefarius/ViGEmBus) 1.22.0
 (BSD-3-Clause, © Nefarius Software Solutions e.U.); see `crates/host/vendor/vigembus/`.
+
+The app's text is set in [Inter](https://rsms.me/inter/) (SIL Open Font License 1.1) and its icons
+are a subset of [Phosphor](https://phosphoricons.com/) (MIT); both are in `app/assets/fonts/` with
+their licenses.
+
+Audio is compressed with [libopus](https://opus-codec.org/) (BSD-3-Clause). Hardware decoding uses
+[gpu-video](https://github.com/software-mansion/smelter) (MIT) and AMD's
+[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT).
