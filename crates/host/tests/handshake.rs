@@ -313,6 +313,79 @@ async fn rapid_gamepad_edges_and_visual_pointer_preserve_input_permissions() {
     timeout(WAIT, host.shutdown()).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn gamepad_report_ranges_survive_transport_and_held_state_is_released() {
+    let (sink, mut injected) = mpsc::unbounded_channel();
+    let (host_ep, host, mut host_events) = start_host(HostConfig {
+        input: InputSink::Channel(sink),
+        ..config()
+    })
+    .await;
+    let (_ep, client, mut events) = start_client(&host_ep).await;
+    request(&mut host_events)
+        .await
+        .respond(Decision::Allow(Permissions::ALL));
+    accepted(&mut events).await;
+    let state = GamepadState {
+        buttons: GamepadState::A | GamepadState::LEFT_SHOULDER,
+        left_trigger: 128,
+        right_trigger: 64,
+        left_y: 32767,
+        right_x: -32768,
+        ..GamepadState::NEUTRAL
+    };
+    let down = InputEvent::Gamepad { pad: 1, state };
+    let neutral = InputEvent::Gamepad {
+        pad: 1,
+        state: GamepadState::NEUTRAL,
+    };
+    client.send_input(down);
+    client.send_input(neutral);
+    client.send_input(down);
+    for expected in [down, neutral, down] {
+        assert_eq!(
+            timeout(WAIT, injected.recv()).await.unwrap().unwrap(),
+            expected
+        );
+    }
+    host.set_permissions(Permissions::VIEW_ONLY);
+    assert_eq!(
+        timeout(WAIT, injected.recv()).await.unwrap().unwrap(),
+        neutral
+    );
+    loop {
+        if matches!(
+            next(&mut events).await,
+            ClientEvent::PermissionsChanged(Permissions::VIEW_ONLY)
+        ) {
+            break;
+        }
+    }
+    client.send_input(down);
+    assert!(
+        timeout(Duration::from_millis(50), injected.recv())
+            .await
+            .is_err()
+    );
+    host.set_permissions(Permissions::ALL);
+    loop {
+        if matches!(
+            next(&mut events).await,
+            ClientEvent::PermissionsChanged(Permissions::ALL)
+        ) {
+            break;
+        }
+    }
+    client.send_input(down);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), down);
+    client.disconnect();
+    assert_eq!(
+        timeout(WAIT, injected.recv()).await.unwrap().unwrap(),
+        neutral
+    );
+    timeout(WAIT, host.shutdown()).await.unwrap();
+}
+
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "captures the local desktop over localhost, requires GPU and audio devices"]

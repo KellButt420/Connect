@@ -53,9 +53,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ctx.send_viewport_cmd(ViewportCommand::CursorPosition(area.center()));
         }
     }
-    if let Some(gamepads) = &client.gamepads {
-        gamepads.set_active(focused && permissions.allows(DeviceClass::Gamepad));
-    }
+    app.gamepads.set_active(focused && permissions.allows(DeviceClass::Gamepad));
     let remote_pointer = pointer.filter(|p| {
         focused && !client.input.captured && video_rect.contains(*p) && !blocked.is_some_and(|rect| rect.contains(*p))
     });
@@ -474,7 +472,6 @@ mod tests {
                     shelf_open: true,
                     show_stats: false,
                     input: Default::default(),
-                    gamepads: None,
                     note: None,
                     exported: Default::default(),
                 });

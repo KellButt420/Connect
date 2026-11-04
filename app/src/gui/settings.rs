@@ -34,6 +34,8 @@ pub struct Settings {
     pub smooth_pacing: bool,
     /// Let hosts send H.265 where this PC's graphics card decodes it.
     pub allow_h265: bool,
+    /// Platform/model-specific USB button layouts. Each record decodes independently.
+    pub gamepad_profiles: super::gamepad::mapping::SavedProfiles,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -69,6 +71,7 @@ impl Default for Settings {
             hardware_decoding: true,
             smooth_pacing: false,
             allow_h265: true,
+            gamepad_profiles: Default::default(),
         }
     }
 }
@@ -121,6 +124,20 @@ pub fn days_ago(then: u64, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_gamepad_profile_keeps_other_preferences_and_old_settings_default() {
+        let old: Settings =
+            ron::from_str("(device_name:\"Old PC\",hardware_decoding:false)").unwrap();
+        assert!(old.gamepad_profiles.entries.is_empty());
+        let settings: Settings = ron::from_str("(device_name:\"My PC\",hardware_decoding:false,gamepad_profiles:(entries:[\"broken profile\"]))").unwrap();
+        assert_eq!(settings.device_name, "My PC");
+        assert!(!settings.hardware_decoding);
+        assert_eq!(settings.gamepad_profiles.errors().len(), 1);
+        let roundtrip: Settings = ron::from_str(&ron::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(roundtrip.device_name, "My PC");
+        assert_eq!(roundtrip.gamepad_profiles.errors().len(), 1);
+    }
 
     fn id(seed: u8) -> EndpointId {
         connect_net::iroh::SecretKey::from_bytes(&[seed; 32]).public()

@@ -1,5 +1,30 @@
 # Connect
 
+Version 0.9.1 adds **Settings → Gamepads** on Windows and Linux: discover USB controllers before
+connecting, test their Xbox output, and save button/trigger mappings for each controller model.
+Use **Rebind**, press the physical control fully, release it, and **Apply**. Conflicting assignments
+are shown before reassignment; **Cancel** discards edits and **Reset to automatic** restores the
+driver mapping after Apply. This release targets USB; Bluetooth and Linux hosting are not included.
+The protocol stays at 8, compatible with 0.9.0 peers.
+
+For incorrect Linux layouts such as A arriving as X or LB arriving as LT, select the controller
+and bind its physical buttons to the intended Xbox outputs. LT/RT retain analog values when the
+source provides them. Move sticks/triggers once and release everything before rebinding; pull
+triggers fully to capture their range. Corrections apply to this viewer and survive reconnects
+and restarts. Identical models share their layout; Linux and Windows mappings stay separate.
+Testing stays local and settings edits take effect only after Apply. Up to four controllers can
+be forwarded; disconnect the viewing session to edit mappings.
+
+If Linux detects no controller, check that the kernel recognizes the USB device and that your
+desktop session can access its `/dev/input/event*` node. Build-time `libudev-dev` is separate from
+runtime device access. Do not run Connect as root or make all input devices world-readable.
+Expand **Controller diagnostics** to identify the device and see source codes/values when reporting
+a problem. Physical validation of the reported Linux controller remains required before claiming
+that its default driver layout is fixed.
+
+Possible latency and sustained-frame-rate work is recorded in the
+[performance roadmap](docs/PERFORMANCE-ROADMAP.md); those streaming changes are separate from v0.9.1.
+
 Version 0.9.0 keeps frames even. Hosts no longer send a full keyframe every 600 frames; where the
 graphics card's encoder offers it, the picture is renewed a band at a time (intra refresh). The
 encoder's buffer is capped at about two frames, so no single frame becomes a burst. The host's
